@@ -270,7 +270,17 @@ def test_census_cli_missing_dataset_emits_stable_reproduction_metadata(
     assert report["seed"] is None
     assert report["config"]["asset_mode"] == "READ_ONLY"
     assert len(report["config_sha256"]) == 64
-    assert set(report["implementation"]) == {"commit", "tree", "worktree_status"}
+    identity_keys = set(report["implementation"])
+    required_identity = {"commit", "tree", "worktree_status"}
+    assert required_identity <= identity_keys
+    if cli_module._verified_source_checkout() is not None:
+        assert identity_keys == required_identity
+    else:
+        assert {"package_name", "package_version"} <= identity_keys
+        assert report["implementation"]["worktree_status"] in {
+            "INSTALLED_IMMUTABLE_CONTENT",
+            "UNVERIFIED_PACKAGE_LAYOUT",
+        }
     assert report["provenance"]["input_paths_recorded"] is False
     assert str(tmp_path) not in output.read_text(encoding="utf-8")
 
@@ -297,9 +307,10 @@ def test_installed_layout_never_inherits_or_writes_foreign_git_identity(
     monkeypatch: pytest.MonkeyPatch,
 ):
     source_root = cli_module._verified_source_checkout()
-    assert source_root == Path(cli_module.__file__).resolve().parents[2]
-    source_output = source_root / "artifacts" / "r0-source-layout-check"
-    assert cli_module._guard_output_location(source_output) == source_output
+    if source_root is not None:
+        assert source_root == Path(cli_module.__file__).resolve().parents[2]
+        source_output = source_root / "artifacts" / "r0-source-layout-check"
+        assert cli_module._guard_output_location(source_output) == source_output
 
     foreign = tmp_path / "foreign-consumer"
     foreign.mkdir()

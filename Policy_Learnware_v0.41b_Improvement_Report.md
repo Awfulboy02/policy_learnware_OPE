@@ -88,7 +88,7 @@ toy 的 action dimension 为 1；determinant normalization 在一维必然把 me
 - tiny temperature 与极大 GP weight 两条路径均在发布模型前原子失败。
 - fixed seed 的 theta/value 在本地锁定 `float64` 测试中显式使用 `rtol/atol` 比较；离散身份与 seed/config digest 仍精确。本轮没有建立跨 backend golden 或 tolerance registry。
 
-ETM 推断 sampler 不在本轮训练机制验收范围内，且与论文/官方 release 均存在重要漂移：当前采用 conditional center + Gaussian initialization、noise `1`、clip `[-10,10]`、默认 20 步（toy 10 步）；论文 OPE 描述约 100 步/noise `0.1`，官方 release 又采用 zero initialization、默认零噪声并沿用 polynomial schedule/clips。该差异可能改变正式 OPE value，因此在正式 benchmark 前保持 `NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT`。当前计算计数也未覆盖 final diagnostic panel 与 inference 的全部 gradient evaluations，发表成本表前必须补齐；本轮不为此扩写 sampler。
+ETM 推断 sampler 不在本轮训练机制验收范围内，且与论文/官方 release 均存在重要漂移：当前采用 conditional center + Gaussian initialization、noise `1`、clip `[-10,10]`、默认 20 步（toy 10 步）；论文 OPE 描述约 100 步/noise `0.1`，官方 release 又采用 zero initialization、默认零噪声并沿用 polynomial schedule/clips。该差异可能改变正式 OPE value，因此在正式 benchmark 前保持 `NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT`。R0 发包纠偏已补齐 training、final diagnostic panel 与 inference Langevin gradient-evaluation 计数，但没有借此改写或提升 sampler 身份。
 
 ## 6. 实际 toy 配置与结果
 
@@ -150,7 +150,7 @@ PASS
 
 ## 9. Production fail-closed preflight
 
-`real-preflight` artifact SHA-256 为 `d68b32c8e63cc5deadf59a80f7570af6f6b66270d2b6f47565ac117d47e6379c`，config SHA-256 为 `00f00677f7d9e4fe64ba572501037e20b33fe05db337badc3511c6ca42a3e2e5`。状态为 `NO_GO`，且：
+算法提交 `79ce56f...` 的 clean snapshot 中，`real-preflight` artifact SHA-256 为 `d68b32c8e63cc5deadf59a80f7570af6f6b66270d2b6f47565ac117d47e6379c`，config SHA-256 为 `00f00677f7d9e4fe64ba572501037e20b33fe05db337badc3511c6ca42a3e2e5`。该 hash 只标识该次 commit snapshot，不是跨 commit 的 golden。状态为 `NO_GO`，且：
 
 - `production_training_started=false`
 - `asset_mutation_started=false`
@@ -195,7 +195,7 @@ OPE 仓受保护引用在算法提交前后保持：
 - KMIFQE 当前 materialize `N×d×d` Hessian、metric 与 transform；在 `N=10^6,d=17` 量级峰值可能超过 13 GB。未在无证据下仓促加入 chunk framework，正式 OPS-DS 前状态为 `NO_GO_OPS_DS_DENSE_HESSIAN_PANEL`。
 - ETM 使用 RFF energy + ridge center，而非官方 4×200 ReLU MLP。
 - ETM training chain选择官方 release 的 polynomial schedule；该 release 与论文 Eq. 23/Table 2 在 drift/step 表述上存在差异。
-- ETM inference 的 initialization/noise/clip/step count 同论文与官方 release 都未对齐，正式 value benchmark 前为 `NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT`；当前成本计数也未包含 final diagnostic/inference 的全部 gradient evaluations。
+- ETM inference 的 initialization/noise/clip/step count 同论文与官方 release 都未对齐，正式 value benchmark 前为 `NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT`；R0 已补齐 training/final-panel/inference gradient-evaluation 计数，协议漂移本身仍未解决。
 - synthetic linear fixture 不验证论文 discontinuity/OOD 场景，也不继承 DOPE claim。
 - 没有 MuJoCo/D4RL 或论文 benchmark numerical parity claim。
 
@@ -203,4 +203,70 @@ OPE 仓受保护引用在算法提交前后保持：
 
 ## 12. 报告副本
 
-canonical tracked copy 位于 OPE 仓库根目录。另两份同字节副本放置于 workspace 根目录和服务器 `/share/songyf/RL_Learnware/` 文档目录。报告自身不嵌入自身 SHA-256，以避免自引用；三处 hash 在发布后由外部 `sha256sum` 核验并在最终交付信息中报告。
+canonical tracked copy 位于 OPE 仓库根目录。v0.41b 初始报告曾同步到 workspace 根目录和服务器 `/share/songyf/RL_Learnware/` 文档目录；R0 release appendix 在交叉审计放行前只更新 canonical 与本地 workspace 副本，服务器副本按边界留待 R1。报告自身不嵌入自身 SHA-256，以避免自引用；发布后由外部 `sha256sum` 核验最终副本。
+
+## 13. R0 大规模发包前轻量化验收附录
+
+### 13.1 纠偏范围与实现身份
+
+R0 代码提交为 `5a3525eebc96126e2bf41496b00eb205f892ebd4`，tree 为 `0b41559cb8282d51b230055871536dc23f83bef2`。该提交只修改现有 `README.md`、`cli.py`、`fqe.py`、`mbope.py` 与三个现有测试文件，没有新增 registry/contract/tolerance framework，也没有触碰 baseline 算法身份、ranking seal/oracle join 或 Raw 协议。
+
+纠偏闭合了四个发包审计缺口：
+
+- source checkout 只有同时验证 `.git`、`pyproject.toml` 的 project name 与真实 `src/policy_learnware_ope/cli.py` 后才读取 Git identity；wheel/installed layout 改为导出 distribution version 与按相对路径排序的包内 Python 内容 digest。安装在 foreign consumer Git 内时不会继承宿主 HEAD/tree，向任何宿主 Git 写 artifact 都会拒绝，repo 外输出保持可用；caller-supplied commit 语义不变。
+- `run.json` 不再抹掉候选级稳定 cost：FQE 的 iteration/linear-solve、KMIFQE 的 Hessian/target/linear-solve、model-based 的 transition/rollout/action-query，以及 ETM inference gradient-evaluation count 均保留；`*_seconds` 仍在 ranking seal 与稳定 estimate 外，`runtime.json` 由单独 SHA-256 绑定。
+- FQE/KMIFQE cell provenance 现在导出精确 `J_gamma=..._H=..._raw` 以及 fit/estimate key digest；toy oracle callback 回归证明六个 ranking seal 全部落盘后才调用 oracle。
+- ETM 导出 training、final diagnostic panel 与 inference Langevin gradient-evaluation 分项计数；KMIFQE dense panel 和 ETM inference alignment 两个科学阻塞进入 toy method scope 与 real-preflight 的机器可读 `method_blockers`。synthetic `ValueEstimate` 仍按实际执行结果为 `PASS`，没有把正式协议 NO_GO 混成 toy 失败。
+
+### 13.2 测试、资源与失败覆盖
+
+clean `5a3525e...` 上的最终命令与结果：
+
+```text
+.venv/bin/python -m pytest -q
+94 passed in 10.40s
+wallclock 10.57s; peak RSS 62,357,504 bytes
+
+.venv/bin/python -m pytest -q <candidate permutation + no-clobber + preflight +
+installed-layout + FQE/KMIFQE density/adjacency/support/convergence/nonfinite +
+MB/ETM refit/nonfinite/zero-ablation + Raw/dataset corruption focused nodes>
+23 passed in 5.78s
+
+git diff --check
+PASS
+```
+
+聚焦失败覆盖包含：NaN/row-count corruption、shape/ABI、sample-ordinal/native-time、missing/unknown density、missing/unverified adjacent action、实质 adjacent-action mismatch、support/ESS、stale target、FQE/KMIFQE nonconvergence/nonfinite、MB failed refit、ETM nonfinite optimizer，以及 Raw response digest/schema。合法 `training_noise_scale=0` 与 `gradient_penalty_weight=0` 消融仍能 fit/estimate，实际配置如实导出；没有放宽 production adjacency/density/oracle/authority gate。
+
+### 13.3 三种子端到端、重放与产物规模
+
+六条方法（Raw fixture + 五条 fitted estimators）在 source CLI 上完成 `fit → estimate → seal → oracle join → metrics/export`：
+
+| seed | 状态 | wallclock | peak RSS | artifact size | discrete reproducibility SHA-256 |
+|---:|---|---:|---:|---:|---|
+| 7 | `TOY_MVP_PASS` | 1.802s | 43,040,768 B | 588 KiB | `cf25d446c0ef4ed12287dc28a548b68762b4de6b7e3e29c616acd41786963f46` |
+| 41 | `TOY_MVP_PASS` | 1.889s | 42,909,696 B | 608 KiB | `9b06b63922078447b852ce9a74fc6c1cd7281a08abc11c4fdcb1e0ec48969893` |
+| 99 | `TOY_MVP_PASS` | 2.113s | 42,876,928 B | 640 KiB | `044fe8cdd1e9a88f2ed004e96ca1b59a4d39d27b911e3384c9659fb73350ec24` |
+
+seed 41 独立重放为 1.897s、42,942,464 B、608 KiB；六个 ranking-seal SHA、reproducibility SHA，以及删除 seal 外 runtime 后包含 estimates/cost/metrics/rank/status 的完整稳定投影均逐字节一致。候选池反序测试按 candidate ID 对齐后采用 `float64` 尺度容差比较 value，并要求 ranking/winner 精确不变；测试通过。三种子允许因数据/seed 变化产生不同估计和 ETM/KMIFQE winner，但每个 cell 的 method ID 均为实际 `G099_H5`，不是伪装的 `H1000`。
+
+产物最大项仍是包含 KMIFQE 机制 history 的 seal/run；单次总量不超过 640 KiB，本轮没有为这个小规模 fixture 扩建 artifact 裁剪系统。
+
+### 13.4 Offline wheel 与 installed-layout 动态验收
+
+使用本机已有且未联网安装的 Python 3.12、`setuptools 84.0.0`、`wheel 0.48.0` 执行：
+
+```text
+python -m pip wheel --no-index --no-build-isolation --no-deps --wheel-dir <temp> .
+SUCCESS: policy_learnware_ope-0.4.1b0-py3-none-any.whl
+```
+
+该次 clean-commit wheel 为 70,604 bytes，artifact SHA-256 `64b8ac7c4a1e281dbf51b4f46abf1d3ca0644b431efa0fcdbe1a232595755c3e`。METADATA 确认为 version `0.4.1b0`、Python `>=3.11`、MIT、`numpy==2.5.2` 与 test extra `pytest==9.1.1`；archive 只含九个包内 Python 文件、LICENSE 与标准 dist-info，没有冻结资产。
+
+wheel 被安装到一个有独立 commit 的 foreign Git consumer 下的 clean target。动态证据为：module 从 target 导入；identity 为 `package_version=0.4.1b0`、`worktree_status=INSTALLED_IMMUTABLE_CONTENT`、package Python tree digest `cf78c43378f1f5966746e976d3fc4469dc29972fc65d1b7acdf4f7db499b5847`，不等于 foreign HEAD；foreign output 被拒绝，repo 外 output 允许。console `--help` PASS；installed seed-7 六方法 toy `TOY_MVP_PASS`，1.728s、43,974,656 B；installed preflight exit 2/`NO_GO`。wheel 是本次临时验证 artifact，不作为 tracked golden；R1 应从最终 branch commit 重新构建并记录自己的精确 digest。
+
+### 13.5 Production preflight 与 R1/R2 边界
+
+source code commit `5a3525e...` 的 `real-preflight` 两次运行均 exit 2/`NO_GO`，字节一致，SHA-256 为 `7692cd4394595fb8057ddba7b80acba2e6b2dac6d2dd11099ca90b88c71282b9`。required asset gates 仍为 actor authority、discounted per-step oracle、exact arbitrary-action behavior density；Raw 仍 `NO_GO_RAW_OPERATOR_AUTHORITY`。方法阻塞另列 `NO_GO_OPS_DS_DENSE_HESSIAN_PANEL` 与 `NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT`。缺 dataset 的 census 稳定返回 `NO_GO`/`DECLARED_ONLY`，没有 KeyError 或 truthy capability 升级。
+
+R0 没有修改服务器、没有 push、没有启动真实资产训练；根任务完成的服务器资源/认证检查保持只读。本轮也没有更改 main/v04b/bootstrap/v03 引用或冻结资产。结论限定为：source release 与 wheel/install smoke 通过，synthetic method-level MVP 可执行、可复现，production preflight 诚实 fail closed。它不是 B20/B22 official reproduction，也不满足完整 v0.4b plan DoD。R1 仅在交叉审计放行后进行三线同步；R2 仍必须先做 P0 live census，不能跳过 authority/density/oracle/Raw 缺口直接启动正式 smoke。
