@@ -806,6 +806,22 @@ def test_real_smoke_seals_three_methods_with_crn_and_resumes_without_reexecution
         tmp_path / "run-a",
         expected_config_sha256=sha256_file(first_config),
     )
+    first_run_path = tmp_path / "run-a" / "run.json"
+    original_run_bytes = first_run_path.read_bytes()
+    tampered_summary = json.loads(original_run_bytes)
+    tampered_summary["status"] = "PASS"
+    tampered_summary["rankings"]["FH_FQE_G099_H1000"] = list(
+        reversed(tampered_summary["rankings"]["FH_FQE_G099_H1000"])
+    )
+    first_run_path.write_bytes(cli_module._canonical_bytes(tampered_summary))
+    with pytest.raises(GateClosed, match="existing run summary differs"):
+        run_real_smoke(
+            first_config,
+            tmp_path / "run-a",
+            expected_config_sha256=sha256_file(first_config),
+            resume=True,
+        )
+    first_run_path.write_bytes(original_run_bytes)
     before_resume = json.loads(json.dumps(calls, default=str))
     resumed = run_real_smoke(
         first_config,

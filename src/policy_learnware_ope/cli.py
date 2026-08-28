@@ -41,6 +41,7 @@ from .benchmark import (
     candidate_set_digest,
     export_metrics,
     join_oracle_and_score,
+    load_ranking_seal,
     oracle_manifest_digest,
     seal_ranking,
 )
@@ -909,10 +910,88 @@ def run_real_smoke(
                 or sha256_file(destination / expected_path) != reference.get("sha256")
             ):
                 raise GateClosed("NO_GO_ASSET_ABI", f"{stage_name} stage seal differs")
-        for reference in final.get("ranking_seals", {}).values():
-            seal_path = destination / reference["path"]
-            if sha256_file(seal_path) != reference["sha256"]:
-                raise GateClosed("NO_GO_ASSET_ABI", "existing ranking seal mismatch")
+        expected_rankings: dict[str, list[str]] = {}
+        expected_seal_references: dict[str, dict[str, str]] = {}
+        for stage_name in ("raw", "fqe", "mbff"):
+            stage = verified_stages[stage_name]
+            method_id = stage.get("method_id")
+            seal_digest = stage.get("seal_sha256")
+            seal_relative = f"{stage_name}/ranking.seal.json"
+            if (
+                not isinstance(method_id, str)
+                or not method_id
+                or stage.get("artifacts", {}).get("ranking.seal.json")
+                != seal_digest
+            ):
+                raise GateClosed(
+                    "NO_GO_ASSET_ABI", f"{stage_name} ranking authority differs"
+                )
+            try:
+                sealed = load_ranking_seal(
+                    destination / seal_relative,
+                    expected_seal_digest=seal_digest,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                raise GateClosed(
+                    "NO_GO_ASSET_ABI", f"{stage_name} ranking seal is invalid"
+                ) from exc
+            sealed_candidate_ids = [
+                row["candidate_id"] for row in sealed.payload["rows"]
+            ]
+            if (
+                sealed.payload["method_id"] != method_id
+                or sealed.payload["context_id"] != protocol["context_id"]
+                or sealed_candidate_ids != candidate_ids
+                or sealed.payload["candidate_set_digest"]
+                != candidate_set_digest(candidate_ids)
+                or sealed.payload["ranking"] != stage.get("ranking")
+            ):
+                raise GateClosed(
+                    "NO_GO_ASSET_ABI", f"{stage_name} ranking binding differs"
+                )
+            expected_rankings[method_id] = list(sealed.payload["ranking"])
+            expected_seal_references[method_id] = {
+                "path": seal_relative,
+                "sha256": seal_digest,
+            }
+        if len(expected_rankings) != 3:
+            raise GateClosed("NO_GO_ASSET_ABI", "ranking method identities collide")
+        expected_all_pass = bool(
+            verified_stages["raw"].get("status") == "PASS"
+            and verified_stages["fqe"].get("all_candidates_pass") is True
+            and verified_stages["mbff"].get("all_candidates_pass") is True
+        )
+        expected_data_summary = {
+            "export_manifest_sha256": verified_stages["data"][
+                "export_manifest_sha256"
+            ],
+            "fit_membership_sha256": verified_stages["data"][
+                "fit_membership_sha256"
+            ],
+            "validation_membership_sha256": verified_stages["data"][
+                "validation_membership_sha256"
+            ],
+            "s0_membership_sha256": verified_stages["data"][
+                "s0_membership_sha256"
+            ],
+            "query_sha256": verified_stages["data"]["query_sha256"],
+        }
+        if (
+            final.get("status")
+            != ("SEALED_PRE_ORACLE" if expected_all_pass else "INCOMPLETE_PRE_ORACLE")
+            or final.get("metrics_status")
+            != ("WAITING_ORACLE" if expected_all_pass else "NOT_READY")
+            or final.get("context_id") != protocol["context_id"]
+            or final.get("task_id") != protocol["task_id"]
+            or final.get("seed") != protocol["seed"]
+            or final.get("gamma") != protocol["gamma"]
+            or final.get("horizon") != protocol["horizon"]
+            or final.get("candidate_ids") != candidate_ids
+            or final.get("data") != expected_data_summary
+            or final.get("rankings") != expected_rankings
+            or final.get("ranking_seals") != expected_seal_references
+        ):
+            raise GateClosed("NO_GO_ASSET_ABI", "existing run summary differs")
         runtime_reference = final.get("runtime")
         runtime_path = destination / "runtime.json"
         if (
