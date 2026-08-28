@@ -172,7 +172,9 @@ OPE 仓受保护引用在算法提交前后保持：
 - `v0.3.1` peeled commit 同为 `8b979f08...`
 - v03 冻结路径 scoped diff 为空。
 
-旧仓整个工作树不能声称 clean：并行 v0.4a 工作在 `server/repro_fpo_ppo_v04a/bpr_runner.py` 有一处既存修改；本轮没有触碰它。
+任务中间快照曾观察到并行 v0.4a 工作对
+`server/repro_fpo_ppo_v04a/bpr_runner.py` 的修改；最终复核时旧仓 HEAD 已由该并行工作推进到
+`de184808bc83fdeaba9ed81bdf548e364345402a` 且 porcelain 为空。这个并发状态变化不属于本轮；贯穿两次快照的冻结事实是 v03 ref/tree 与 scoped paths 均未变化，本轮没有写入旧仓。
 
 本地小型 manifest 锚点：pool `8cb95e...`、inventory `c21e15...`、championization `ce6b8e...`、returns `853a68...`、protocol manifest `e58928...`、selector pool `7f9d78...`。交叉 digest 一致，inventory 为 complete、60 items/0 rejected，其中 FPO 30、6 tasks × 5 seeds；30 个本地 FPO candidate manifest complete，30 个 parity report passed/raw_checked。远端巨型 bundle/log 本轮未逐字节重哈希，所以结论限定为“v03 Git 冻结 + 本地 manifest/cross-link/digest 未见变化”。
 
