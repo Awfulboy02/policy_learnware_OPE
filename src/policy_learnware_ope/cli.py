@@ -7,19 +7,40 @@ from dataclasses import dataclass
 from hashlib import sha256
 import json
 from pathlib import Path
+import subprocess
+from time import perf_counter
 from typing import Any, Sequence
 
 import numpy as np
 
-from .adapters import RawDeltaTask5Adapter, SealedRawOperator, census_real_assets, sha256_file
-from .benchmark import export_metrics, join_oracle_and_score, seal_ranking
-from .core import EstimateStatus, PolicySemantics, TransitionBatch, ValueEstimate
-from .fqe import (
-    FH_FQE_METHOD_ID,
-    FH_KMIFQE_METHOD_ID,
-    FiniteHorizonFQE,
-    FiniteHorizonKMIFQE,
+from .adapters import (
+    FROZEN_V03_COMMIT,
+    FROZEN_V03_TREE,
+    RAW_FIXTURE_METHOD_ID,
+    RAW_QUERY_SCHEMA,
+    RAW_REQUEST_SCHEMA,
+    RAW_RESPONSE_SCHEMA,
+    RawDeltaTask5Adapter,
+    SealedRawOperator,
+    census_real_assets,
+    sha256_file,
 )
+from .benchmark import (
+    ORACLE_MANIFEST_SCHEMA,
+    candidate_set_digest,
+    export_metrics,
+    join_oracle_and_score,
+    oracle_manifest_digest,
+    seal_ranking,
+)
+from .core import (
+    EstimateStatus,
+    PolicySemantics,
+    TransitionBatch,
+    ValueEstimate,
+    finite_horizon_value_convention,
+)
+from .fqe import FiniteHorizonFQE, FiniteHorizonKMIFQE
 from .mbope import (
     AR_MBOPE_ID,
     DOPE_STYLE_MB_FF_ID,
@@ -31,11 +52,94 @@ from .mbope import (
 TOY_CONTEXT = "synthetic_linear_native_time_v1"
 TOY_HORIZON = 5
 TOY_GAMMA = 0.99
+TOY_VALUE_CONVENTION = finite_horizon_value_convention(TOY_GAMMA, TOY_HORIZON)
+V04B_PLAN_SHA256 = "5fb35cc2ee4c27afd411f77f0c2813088b6d6ab901f8910f442ed5b231e1719e"
 
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+
+
+def _canonical_bytes(payload: Any) -> bytes:
+    return (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode("utf-8")
+
+
+def _payload_digest(payload: Any) -> str:
+    return sha256(_canonical_bytes(payload)).hexdigest()
+
+
+def _write_canonical_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as handle:
+        handle.write(_canonical_bytes(payload))
+
+
+def _containing_git_root(path: Path) -> Path | None:
+    current = path if path.is_dir() else path.parent
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate.resolve()
+    return None
+
+
+def _guard_output_location(path: str | Path) -> Path:
+    """Reject writes into any Git repository other than this companion."""
+
+    destination = Path(path).resolve()
+    containing_repo = _containing_git_root(destination)
+    companion_repo = Path(__file__).resolve().parents[2]
+    if containing_repo is not None and containing_repo != companion_repo:
+        raise PermissionError(
+            f"refusing to write into a different Git repository: {containing_repo}"
+        )
+    return destination
+
+
+def _implementation_identity(commit_override: str | None = None) -> dict[str, Any]:
+    if commit_override is not None:
+        return {
+            "commit": str(commit_override),
+            "tree": "CALLER_SUPPLIED",
+            "worktree_status": "CALLER_SUPPLIED",
+        }
+    repository = Path(__file__).resolve().parents[2]
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=repository,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        worktree = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repository,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout
+        return {
+            "commit": commit,
+            "tree": tree,
+            "worktree_status": "CLEAN" if not worktree else "DIRTY",
+        }
+    except (OSError, subprocess.CalledProcessError):
+        return {
+            "commit": "UNAVAILABLE",
+            "tree": "UNAVAILABLE",
+            "worktree_status": "UNVERIFIED",
+        }
 
 
 @dataclass(frozen=True)
@@ -113,8 +217,20 @@ def _toy_batch(seed: int, *, episodes: int = 48) -> TransitionBatch:
             reasons.append("horizon" if is_horizon else "none")
             state = next_state
     rows = episodes * TOY_HORIZON
-    digest_payload = np.concatenate(
-        [np.asarray(observation).reshape(-1), np.asarray(action).reshape(-1), np.asarray(reward)]
+    source_digest = _payload_digest(
+        {
+            "schema": "policy-learnware.synthetic-transition-batch.v1",
+            "observation": observation,
+            "action": action,
+            "reward": reward,
+            "next_observation": next_observation,
+            "terminated": terminated,
+            "truncated": truncated,
+            "dataset_cut": dataset_cut,
+            "native_timestep": timestep,
+            "episode_id": episode_id,
+            "episode_offsets": list(range(0, rows + 1, TOY_HORIZON)),
+        }
     )
     return TransitionBatch(
         observation=np.asarray(observation),
@@ -130,7 +246,24 @@ def _toy_batch(seed: int, *, episodes: int = 48) -> TransitionBatch:
         timestep_provenance="episode_offsets",
         next_behavior_action=np.asarray(next_behavior_action),
         truncation_reason=np.asarray(reasons),
-        source_digest=sha256(np.asarray(digest_payload, dtype="<f8").tobytes()).hexdigest(),
+        source_digest=source_digest,
+    )
+
+
+def _raw_membership_digest(batch: TransitionBatch) -> str:
+    """Bind the reward-free physical transition view consumed by Raw."""
+
+    return _payload_digest(
+        {
+            "schema": "policy-learnware.raw-physical-membership.v1",
+            "fields": {
+                "observation": batch.observation.tolist(),
+                "action": batch.action.tolist(),
+                "next_observation": batch.next_observation.tolist(),
+                "native_timestep": batch.native_timestep.tolist(),
+                "episode_offsets": batch.episode_offsets.tolist(),
+            },
+        }
     )
 
 
@@ -170,96 +303,203 @@ def _toy_oracle(candidates: Sequence[_ToyActor], initial_states: np.ndarray) -> 
 def _combined_diagnostics(estimate: ValueEstimate) -> dict[str, Any]:
     diagnostics = dict(estimate.diagnostics)
     diagnostics.update(dict(estimate.support))
-    diagnostics.update(dict(estimate.cost))
-    if "runtime_seconds" not in diagnostics:
-        diagnostics["runtime_seconds"] = float(
-            diagnostics.get("fit_seconds", 0.0) + diagnostics.get("estimate_seconds", 0.0)
-        )
     return diagnostics
 
 
-def _toy_method_scope() -> dict[str, dict[str, str]]:
-    return {
-        FH_FQE_METHOD_ID: {
-            "status": "TOY_MVP_PASS",
-            "scope": "finite-horizon NumPy ridge FQE; project adaptation, not upstream reproduction",
-        },
-        FH_KMIFQE_METHOD_ID: {
-            "status": "TOY_MVP_PASS",
-            "scope": "exact-density kernel/importance feasibility implementation; full learned Hessian metric parity pending",
-        },
-        ETM_MBOPE_ID: {
-            "status": "TOY_MVP_PASS",
-            "scope": "compact RFF contrastive energy plus Langevin sampler; not official ETM architecture parity",
-        },
-        DOPE_STYLE_MB_FF_ID: {
-            "status": "TOY_MVP_PASS",
-            "scope": "project-defined residual-Gaussian random-feature ridge ensemble; DOPE is not an algorithm",
-        },
-        AR_MBOPE_ID: {
-            "status": "TOY_MVP_PASS",
-            "scope": "B06-inspired fixed-order teacher-forced/sequential autoregressive model",
-        },
-        "RAW_DELTA_TASK5": {
-            "status": "TOY_ADAPTER_PARITY_PASS",
-            "scope": "sealed-output delegation only; no Raw-RKME mathematics copied into this repository",
-        },
+def _without_volatile_fields(value: Any) -> Any:
+    volatile_tokens = (
+        "runtime",
+        "wallclock",
+        "elapsed",
+        "duration",
+        "latency",
+        "fitseconds",
+        "estimateseconds",
+    )
+    if isinstance(value, dict):
+        stable: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = "".join(character for character in str(key).casefold() if character.isalnum())
+            if any(token in normalized for token in volatile_tokens) or normalized.endswith(
+                ("seconds", "milliseconds", "microseconds", "nanoseconds")
+            ):
+                continue
+            stable[str(key)] = _without_volatile_fields(item)
+        return stable
+    if isinstance(value, list):
+        return [_without_volatile_fields(item) for item in value]
+    return value
+
+
+def _stable_estimate(estimate: ValueEstimate) -> dict[str, Any]:
+    payload = _without_volatile_fields(estimate.to_dict())
+    payload["cost"] = {"reported_separately": "runtime.json"}
+    return payload
+
+
+def _toy_method_scope(method_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+    scopes: dict[str, dict[str, Any]] = {}
+    for method_id in method_ids:
+        if method_id.startswith("FH_FQE_"):
+            scopes[method_id] = {
+                "status": "TOY_MVP_PASS",
+                "scope": (
+                    "finite-horizon NumPy ridge FQE; project adaptation, "
+                    "not upstream reproduction"
+                ),
+                "official_paper_parity": False,
+            }
+        elif method_id.startswith("FH_KMIFQE_"):
+            scopes[method_id] = {
+                "status": "TOY_MVP_PASS",
+                "scope": (
+                    "KMIFQE project adaptation with an exact-density fixture; "
+                    "full learned-Hessian reference parity is deferred"
+                ),
+                "scientific_role": "PROJECT_ADAPTATION",
+                "official_paper_parity": False,
+            }
+        elif method_id.startswith("ETM_MBOPE_"):
+            scopes[method_id] = {
+                "status": "TOY_MVP_PASS",
+                "scope": "compact contrastive-energy/Langevin project proxy",
+                "scientific_role": "PROJECT_CONTRASTIVE_ENERGY_ADAPTATION_PROXY",
+                "official_paper_parity": False,
+            }
+        elif method_id.startswith("DOPE_STYLE_MB_FF_"):
+            scopes[method_id] = {
+                "status": "TOY_MVP_PASS",
+                "scope": (
+                    "project-defined residual-Gaussian random-feature ridge ensemble; "
+                    "DOPE is not an algorithm"
+                ),
+                "scientific_role": "PROJECT_DEFINED_REFERENCE",
+                "official_paper_parity": False,
+            }
+        elif method_id.startswith("AR_MBOPE_"):
+            scopes[method_id] = {
+                "status": "TOY_MVP_PASS",
+                "scope": "B06-inspired fixed-order teacher-forced/sequential project proxy",
+                "scientific_role": "PROJECT_METHOD_LEVEL_ADAPTATION_PROXY",
+                "official_paper_parity": False,
+            }
+        else:
+            raise ValueError(f"unknown toy method identity: {method_id}")
+    scopes[RAW_FIXTURE_METHOD_ID] = {
+        "status": "TOY_FIXTURE_PASS",
+        "scope": "reward-free sealed-response adapter fixture; no production Raw/RKME operator is connected",
+        "scientific_role": "FIXTURE_ONLY",
+        "official_paper_parity": False,
+        "production_status": "NO_GO_RAW_OPERATOR_AUTHORITY",
     }
+    return scopes
 
 
-def run_toy(output: str | Path, *, seed: int = 7) -> dict[str, Any]:
-    destination = Path(output).resolve()
+def run_toy(
+    output: str | Path,
+    *,
+    seed: int = 7,
+    implementation_commit: str | None = None,
+) -> dict[str, Any]:
+    destination = _guard_output_location(output)
+    if destination.exists() and not destination.is_dir():
+        raise FileExistsError(f"toy output exists and is not a directory: {destination}")
+    if destination.is_dir() and any(destination.iterdir()):
+        raise FileExistsError(
+            f"toy output directory must be empty; refusing partial overwrite: {destination}"
+        )
     destination.mkdir(parents=True, exist_ok=True)
+    if isinstance(seed, bool) or int(seed) != seed or int(seed) < 0:
+        raise ValueError("seed must be a non-negative integer")
+    seed = int(seed)
+    implementation = _implementation_identity(implementation_commit)
+    implementation_commit = implementation["commit"]
+    model_specs: list[tuple[str, str, dict[str, Any]]] = [
+        (
+            ETM_MBOPE_ID,
+            "ETM_MBOPE",
+            {
+                "hidden_dim": 24,
+                "energy_features": 48,
+                "negatives": 3,
+                "contrastive_steps": 40,
+                "learning_rate": 0.01,
+                "langevin_steps": 10,
+                "langevin_step_size": 0.025,
+            },
+        ),
+        (
+            DOPE_STYLE_MB_FF_ID,
+            "DOPE_STYLE_MB_FF",
+            {"ensemble_members": 3, "hidden_dim": 24},
+        ),
+        (
+            AR_MBOPE_ID,
+            "AR_MBOPE",
+            {"ensemble_members": 2, "hidden_dim": 20},
+        ),
+    ]
+    config: dict[str, Any] = {
+        "schema": "policy-learnware.toy-config.v2",
+        "seed": seed,
+        "context_id": TOY_CONTEXT,
+        "gamma": TOY_GAMMA,
+        "horizon": TOY_HORIZON,
+        "episodes": 48,
+        "candidate_count": 5,
+        "fqe": {
+            "ridge": 1e-7,
+            "max_iterations": 2500,
+            "tolerance": 1e-8,
+        },
+        "model_based": {family: kwargs for _, family, kwargs in model_specs},
+        "rollouts_per_initial": 12,
+    }
+    config_digest = _payload_digest(config)
     batch = _toy_batch(seed)
     candidates = _toy_candidates()
     initial = _toy_initial_states()
     density = _ExactGaussianDensity()
     estimates: dict[str, dict[str, ValueEstimate]] = {}
+    runtime_by_method: dict[str, float] = {}
 
-    for method_id, estimator_type in (
-        (FH_FQE_METHOD_ID, FiniteHorizonFQE),
-        (FH_KMIFQE_METHOD_ID, FiniteHorizonKMIFQE),
-    ):
+    for estimator_type in (FiniteHorizonFQE, FiniteHorizonKMIFQE):
+        method_started = perf_counter()
         method_estimates: dict[str, ValueEstimate] = {}
+        actual_method_id: str | None = None
         for candidate_index, candidate in enumerate(candidates):
             estimator = estimator_type(
                 gamma=TOY_GAMMA,
                 horizon=TOY_HORIZON,
                 ridge=1e-7,
-                max_iterations=100,
+                max_iterations=2500,
+                tolerance=1e-8,
             )
+            if actual_method_id is None:
+                actual_method_id = estimator.method_id
+            elif estimator.method_id != actual_method_id:
+                raise RuntimeError("one estimator family produced inconsistent method IDs")
             fit_keys = np.arange(len(batch), dtype=np.uint64) + candidate_index * 10_000
-            if method_id == FH_KMIFQE_METHOD_ID:
+            if estimator_type is FiniteHorizonKMIFQE:
                 estimator.fit(batch, candidate, behavior_density=density, fit_keys=fit_keys)
             else:
                 estimator.fit(batch, candidate, fit_keys=fit_keys)
             estimate_keys = np.arange(len(initial), dtype=np.uint64) + candidate_index * 100_000
             method_estimates[candidate.policy_id] = estimator.estimate(initial, keys=estimate_keys)
-        estimates[method_id] = method_estimates
+        if actual_method_id is None:
+            raise RuntimeError("toy fixture has no candidates")
+        estimates[actual_method_id] = method_estimates
+        runtime_by_method[actual_method_id] = perf_counter() - method_started
 
-    model_kwargs: dict[str, dict[str, Any]] = {
-        DOPE_STYLE_MB_FF_ID: {"ensemble_members": 3, "hidden_dim": 24},
-        AR_MBOPE_ID: {"ensemble_members": 2, "hidden_dim": 20},
-        ETM_MBOPE_ID: {
-            "hidden_dim": 24,
-            "energy_features": 48,
-            "negatives": 3,
-            "contrastive_steps": 40,
-            "learning_rate": 0.01,
-            "langevin_steps": 10,
-            "langevin_step_size": 0.025,
-        },
-    }
-    for method_index, method_id in enumerate(
-        (ETM_MBOPE_ID, DOPE_STYLE_MB_FF_ID, AR_MBOPE_ID)
-    ):
+    for method_index, (selector_id, _family, model_kwargs) in enumerate(model_specs):
+        method_started = perf_counter()
         estimator = make_model_based_estimator(
-            method_id,
+            selector_id,
             gamma=TOY_GAMMA,
             horizon=TOY_HORIZON,
             rollouts_per_initial=12,
             ridge=1e-4,
-            **model_kwargs[method_id],
+            **model_kwargs,
         ).fit(
             batch,
             candidates[0],
@@ -273,49 +513,106 @@ def run_toy(output: str | Path, *, seed: int = 7) -> dict[str, Any]:
                 keys=estimate_keys,
                 candidate=candidate,
             )
-        estimates[method_id] = method_estimates
+        estimates[estimator.method_id] = method_estimates
+        runtime_by_method[estimator.method_id] = perf_counter() - method_started
 
     candidate_tasks = {candidate.policy_id: "TOY_TASK" for candidate in candidates}
-    raw_fixture_path = destination / "delegated_raw_fixture.json"
+    candidate_ids = sorted(candidate_tasks)
+    raw_membership_digest = _raw_membership_digest(batch)
+    query_payload = {
+        "schema": RAW_QUERY_SCHEMA,
+        "context_id": TOY_CONTEXT,
+        "membership_digest": raw_membership_digest,
+        "fields": {
+            "observation": batch.observation.tolist(),
+            "action": batch.action.tolist(),
+            "next_observation": batch.next_observation.tolist(),
+            "native_timestep": batch.native_timestep.tolist(),
+            "episode_offsets": batch.episode_offsets.tolist(),
+        },
+    }
+    raw_query_path = destination / "raw_query.reward_free.json"
+    _write_canonical_json(raw_query_path, query_payload)
+    query_artifact_digest = sha256_file(raw_query_path)
     raw_fixture_scores = {
         candidate.policy_id: abs(candidate.gain + 0.06) + abs(candidate.bias - 0.15)
         for candidate in candidates
     }
+    raw_request_binding = {
+        "request_schema": RAW_REQUEST_SCHEMA,
+        "method_id": RAW_FIXTURE_METHOD_ID,
+        "task_id": "TOY_TASK",
+        "context_id": TOY_CONTEXT,
+        "candidate_ids": candidate_ids,
+        "query": {
+            "schema": RAW_QUERY_SCHEMA,
+            "artifact_sha256": query_artifact_digest,
+            "fields": [
+                "observation",
+                "action",
+                "next_observation",
+                "native_timestep",
+                "episode_offsets",
+            ],
+            "forbidden_fields": ["reward", "oracle", "candidate_action"],
+        },
+        "membership_digest": raw_membership_digest,
+    }
+    raw_request_sha256 = sha256(
+        json.dumps(raw_request_binding, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    raw_fixture_path = destination / "raw_fixture.response.json"
     _write_json(
         raw_fixture_path,
         {
-            "schema": "synthetic-frozen-raw-output.v1",
-            "context_id": TOY_CONTEXT,
+            "schema": RAW_RESPONSE_SCHEMA,
+            "request_binding": raw_request_binding,
+            "request_sha256": raw_request_sha256,
             "scores": raw_fixture_scores,
             "synthetic_fixture_only": True,
         },
     )
     raw_adapter = RawDeltaTask5Adapter(
-        SealedRawOperator(raw_fixture_path, sha256_file(raw_fixture_path))
+        SealedRawOperator(raw_fixture_path, sha256_file(raw_fixture_path)),
+        method_id=RAW_FIXTURE_METHOD_ID,
     )
+    raw_started = perf_counter()
     raw_scores = raw_adapter.score(
         context_id=TOY_CONTEXT,
         task_id="TOY_TASK",
         candidate_tasks=candidate_tasks,
-        query_artifact="synthetic://raw-delta-query",
-        membership_digest=batch.source_digest or "",
+        query_artifact_digest=query_artifact_digest,
+        membership_digest=raw_membership_digest,
     )
+    runtime_by_method[RAW_FIXTURE_METHOD_ID] = perf_counter() - raw_started
 
-    seals: dict[str, str] = {}
+    seals: dict[str, dict[str, str]] = {}
     raw_seal = seal_ranking(
-        destination / "seals" / "RAW_DELTA_TASK5.json",
-        method_id="RAW_DELTA_TASK5",
+        destination / "seals" / f"{RAW_FIXTURE_METHOD_ID}.json",
+        method_id=RAW_FIXTURE_METHOD_ID,
         context_id=TOY_CONTEXT,
         score_kind="compatibility",
         scores=raw_scores,
         provenance={
             "synthetic_fixture_only": True,
-            "delegated_artifact_sha256": sha256_file(raw_fixture_path),
-            "membership_digest": batch.source_digest,
+            "scientific_role": "FIXTURE_ONLY",
+            "official_paper_parity": False,
+            "response_artifact_sha256": sha256_file(raw_fixture_path),
+            "query_artifact_sha256": query_artifact_digest,
+            "membership_digest": raw_membership_digest,
+            "seed": seed,
+            "implementation_commit": implementation_commit,
+            "implementation_tree": implementation["tree"],
+            "implementation_worktree_status": implementation["worktree_status"],
+            "config_sha256": config_digest,
         },
         higher_is_better=False,
+        value_convention=TOY_VALUE_CONVENTION,
     )
-    seals["RAW_DELTA_TASK5"] = str(raw_seal.path)
+    seals[RAW_FIXTURE_METHOD_ID] = {
+        "path": f"seals/{RAW_FIXTURE_METHOD_ID}.json",
+        "sha256": raw_seal.digest,
+    }
 
     for method_id, method_estimates in estimates.items():
         scores = {candidate_id: estimate.value for candidate_id, estimate in method_estimates.items()}
@@ -341,25 +638,77 @@ def run_toy(output: str | Path, *, seed: int = 7) -> dict[str, Any]:
                 "gamma": TOY_GAMMA,
                 "horizon": TOY_HORIZON,
                 "stage": "pre_join_sealed",
+                "seed": seed,
+                "implementation_commit": implementation_commit,
+                "implementation_tree": implementation["tree"],
+                "implementation_worktree_status": implementation["worktree_status"],
+                "config_sha256": config_digest,
+                "official_paper_parity": False,
             },
-            value_convention=f"toy_J_gamma={TOY_GAMMA}_H={TOY_HORIZON}_raw",
+            value_convention=TOY_VALUE_CONVENTION,
         )
-        seals[method_id] = str(seal.path)
+        seals[method_id] = {
+            "path": f"seals/{method_id}.json",
+            "sha256": seal.digest,
+        }
 
     # Synthetic oracle evaluation is deliberately invoked only after every
     # method score and ranking has been sealed.
     oracle_values = _toy_oracle(candidates, initial)
-    metrics = [
-        join_oracle_and_score(seal_path, oracle_values=oracle_values)
-        for _, seal_path in sorted(seals.items())
-    ]
+    oracle_manifest = {
+        "schema": ORACLE_MANIFEST_SCHEMA,
+        "context_id": TOY_CONTEXT,
+        "candidate_values": oracle_values,
+        "candidate_set_digest": candidate_set_digest(candidate_ids),
+        "value_convention": TOY_VALUE_CONVENTION,
+    }
+    expected_oracle_digest = oracle_manifest_digest(oracle_manifest)
+    _write_canonical_json(destination / "oracle_manifest.synthetic.json", oracle_manifest)
+    metrics: list[dict[str, Any]] = []
+    for method_id, seal_ref in sorted(seals.items()):
+        metric = join_oracle_and_score(
+            destination / seal_ref["path"],
+            expected_seal_digest=seal_ref["sha256"],
+            oracle_manifest=oracle_manifest,
+            expected_oracle_digest=expected_oracle_digest,
+        )
+        # Wall-clock measurements are attached only after the stable seal has
+        # been authenticated and joined.
+        metric["runtime_seconds"] = runtime_by_method[method_id]
+        metrics.append(metric)
     metric_paths = export_metrics(
         metrics,
         json_path=destination / "metrics.json",
         csv_path=destination / "metrics.csv",
     )
+    runtime_payload = {
+        "schema": "policy-learnware.runtime.v1",
+        "outside_ranking_seal": True,
+        "method_runtime_seconds": runtime_by_method,
+    }
+    _write_json(destination / "runtime.json", runtime_payload)
+    stable_estimates = {
+        method_id: {
+            candidate_id: _stable_estimate(estimate)
+            for candidate_id, estimate in method_estimates.items()
+        }
+        for method_id, method_estimates in estimates.items()
+    }
+    reproducibility_payload = {
+        "seed": seed,
+        "config_sha256": config_digest,
+        "estimates": stable_estimates,
+        "raw_scores": raw_scores,
+        "ranking_seal_sha256": {
+            method_id: seal_ref["sha256"] for method_id, seal_ref in sorted(seals.items())
+        },
+    }
+    method_scope = _toy_method_scope(sorted(estimates))
+    for method_id, method_estimates in estimates.items():
+        if any(estimate.status is not EstimateStatus.PASS for estimate in method_estimates.values()):
+            method_scope[method_id]["status"] = "TOY_MVP_FAILED"
     result = {
-        "schema": "policy-learnware.toy-run.v1",
+        "schema": "policy-learnware.toy-run.v2",
         "status": "TOY_MVP_PASS"
         if all(
             estimate.status is EstimateStatus.PASS
@@ -368,28 +717,105 @@ def run_toy(output: str | Path, *, seed: int = 7) -> dict[str, Any]:
         )
         else "TOY_MVP_FAILED",
         "synthetic_fixture_only": True,
+        "seed": seed,
+        "implementation_commit": implementation_commit,
+        "implementation": implementation,
+        "config": config,
+        "config_sha256": config_digest,
+        "reproducibility_sha256": _payload_digest(reproducibility_payload),
         "context_id": TOY_CONTEXT,
         "gamma": TOY_GAMMA,
         "horizon": TOY_HORIZON,
         "candidate_count": len(candidates),
         "transition_count": len(batch),
-        "method_scope": _toy_method_scope(),
-        "estimates": {
-            method_id: {
-                candidate_id: estimate.to_dict()
-                for candidate_id, estimate in method_estimates.items()
-            }
-            for method_id, method_estimates in estimates.items()
-        },
+        "method_scope": method_scope,
+        "estimates": stable_estimates,
         "raw_scores": raw_scores,
         "oracle_values_after_seal": oracle_values,
+        "oracle_manifest_sha256": expected_oracle_digest,
         "metrics": metrics,
-        "artifacts": metric_paths,
+        "artifacts": {
+            "metrics_json": "metrics.json",
+            "metrics_json_sha256": metric_paths["json_sha256"],
+            "metrics_csv": "metrics.csv",
+            "metrics_csv_sha256": metric_paths["csv_sha256"],
+            "runtime": "runtime.json",
+            "raw_query": "raw_query.reward_free.json",
+            "raw_query_sha256": query_artifact_digest,
+            "raw_membership_sha256": raw_membership_digest,
+            "raw_response": "raw_fixture.response.json",
+            "raw_response_sha256": sha256_file(raw_fixture_path),
+            "synthetic_oracle_manifest": "oracle_manifest.synthetic.json",
+        },
         "ranking_seals": seals,
         "real_asset_training_started": False,
+        "production_raw_status": "NO_GO_RAW_OPERATOR_AUTHORITY",
     }
     _write_json(destination / "run.json", result)
     return result
+
+
+def build_real_preflight(*, implementation_commit: str | None = None) -> dict[str, Any]:
+    """Return a stable frozen-fact gate without claiming a live census join."""
+
+    implementation = _implementation_identity(implementation_commit)
+    implementation_commit = implementation["commit"]
+    config = {
+        "schema": "policy-learnware.real-preflight-config.v1",
+        "primary_value_convention": "J_gamma=0.99_H=1000_raw",
+        "frozen_v03_commit": FROZEN_V03_COMMIT,
+        "frozen_v03_tree": FROZEN_V03_TREE,
+        "plan_sha256": V04B_PLAN_SHA256,
+        "asset_mode": "READ_ONLY",
+    }
+    required_gates = {
+        "actor_authority": {
+            "status": "NO_GO",
+            "code": "NO_GO_ACTOR_AUTHORITY",
+            "reason": "no executable actor/repository authority checker is connected",
+        },
+        "discounted_oracle": {
+            "status": "NO_GO",
+            "code": "NO_GO_ORACLE_DISCOUNTED_VALUE",
+            "reason": "existing oracle exposes episodic returns, not per-step rewards bound to J_0.99,H1000",
+        },
+        "exact_behavior_density": {
+            "status": "NO_GO",
+            "code": "NO_GO_EXISTING_LOG_DENSITY",
+            "reason": "existing clipped-Gaussian logs have no verified arbitrary-action exact density",
+        },
+    }
+    return {
+        "schema": "policy-learnware.real-preflight.v1",
+        "status": "NO_GO",
+        "seed": None,
+        "implementation_commit": implementation_commit,
+        "implementation": implementation,
+        "config": config,
+        "config_sha256": _payload_digest(config),
+        "required_gates": required_gates,
+        "raw_adapter": {
+            "status": "NO_GO",
+            "code": "NO_GO_RAW_OPERATOR_AUTHORITY",
+            "reason": "no digest-locked Raw-Delta/RKME export from frozen v03 is connected",
+        },
+        "method_readiness": {
+            "FH_FQE_G099_H1000": "NO_GO_ACTOR_AUTHORITY",
+            "FH_KMIFQE_G099_H1000": "NO_GO_EXISTING_LOG_DENSITY",
+            "ETM_MBOPE_G099_H1000": "NO_GO_ACTOR_AUTHORITY",
+            "DOPE_STYLE_MB_FF_G099_H1000": "NO_GO_ACTOR_AUTHORITY",
+            "AR_MBOPE_G099_H1000": "NO_GO_ACTOR_AUTHORITY",
+            "RAW_DELTA_TASK5_PROJECT_ADAPTER": "NO_GO_RAW_OPERATOR_AUTHORITY",
+        },
+        "production_training_started": False,
+        "asset_mutation_started": False,
+        "provenance": {
+            "evidence_scope": "frozen-fact pre-asset gate",
+            "live_census_artifact_joined": False,
+            "capabilities_are_not_inferred_from_truthy_manifest_fields": True,
+            "official_paper_parity_claimed": False,
+        },
+    }
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -403,8 +829,17 @@ def _build_parser() -> argparse.ArgumentParser:
     census.add_argument("--oracle", type=Path)
     census.add_argument("--density-manifest", type=Path)
     census.add_argument("--actor-authority", type=Path)
+    census.add_argument("--expected-dataset-digest")
+    census.add_argument("--expected-oracle-digest")
+    census.add_argument("--expected-density-manifest-digest")
+    census.add_argument("--expected-actor-authority-digest")
     census.add_argument("--horizon", type=int, default=1000)
     census.add_argument("--output", type=Path)
+    preflight = commands.add_parser(
+        "real-preflight",
+        help="emit the stable fail-closed production readiness decision",
+    )
+    preflight.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -412,26 +847,80 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "toy":
         result = run_toy(args.output, seed=args.seed)
+        run_path = Path(args.output).resolve() / "run.json"
         print(
             json.dumps(
                 {
                     "status": result["status"],
-                    "run": str(Path(args.output).resolve() / "run.json"),
+                    "run": str(run_path),
+                    "run_sha256": sha256_file(run_path),
                     "methods": sorted(result["method_scope"]),
+                    "ranking_seal_sha256": {
+                        method_id: seal_ref["sha256"]
+                        for method_id, seal_ref in sorted(result["ranking_seals"].items())
+                    },
+                    "oracle_manifest_sha256": result["oracle_manifest_sha256"],
                 },
                 sort_keys=True,
             )
         )
         return 0 if result["status"] == "TOY_MVP_PASS" else 1
+    if args.command == "real-preflight":
+        report = build_real_preflight()
+        output_path = _guard_output_location(args.output)
+        _write_canonical_json(output_path, report)
+        print(
+            json.dumps(
+                {
+                    "status": report["status"],
+                    "artifact": str(output_path),
+                    "sha256": sha256_file(output_path),
+                },
+                sort_keys=True,
+            )
+        )
+        return 2
     report = census_real_assets(
         dataset_path=args.dataset,
         oracle_path=args.oracle,
         density_manifest_path=args.density_manifest,
         actor_authority_path=args.actor_authority,
         horizon=args.horizon,
+        expected_dataset_digest=args.expected_dataset_digest,
+        expected_oracle_digest=args.expected_oracle_digest,
+        expected_density_manifest_digest=args.expected_density_manifest_digest,
+        expected_actor_authority_digest=args.expected_actor_authority_digest,
+    )
+    implementation = _implementation_identity()
+    census_config = {
+        "schema": "policy-learnware.real-asset-census-config.v1",
+        "horizon": args.horizon,
+        "expected_dataset_sha256": args.expected_dataset_digest,
+        "expected_oracle_sha256": args.expected_oracle_digest,
+        "expected_density_manifest_sha256": args.expected_density_manifest_digest,
+        "expected_actor_authority_sha256": args.expected_actor_authority_digest,
+        "oracle_supplied": args.oracle is not None,
+        "density_manifest_supplied": args.density_manifest is not None,
+        "actor_authority_supplied": args.actor_authority is not None,
+        "asset_mode": "READ_ONLY",
+    }
+    report.update(
+        {
+            "seed": None,
+            "implementation_commit": implementation["commit"],
+            "implementation": implementation,
+            "config": census_config,
+            "config_sha256": _payload_digest(census_config),
+            "provenance": {
+                "input_paths_recorded": False,
+                "asset_mode": "READ_ONLY",
+                "plan_sha256": V04B_PLAN_SHA256,
+                "capabilities_require_executable_checkers": True,
+            },
+        }
     )
     if args.output:
-        _write_json(args.output.resolve(), report)
+        _write_canonical_json(_guard_output_location(args.output), report)
     print(json.dumps(report, sort_keys=True))
     return 0 if report["status"] == "PASS" else 2
 

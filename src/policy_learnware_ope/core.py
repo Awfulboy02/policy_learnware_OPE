@@ -40,6 +40,7 @@ class EstimateStatus(str, Enum):
     NO_GO_TARGET_POLICY_SEMANTICS = "NO_GO_TARGET_POLICY_SEMANTICS"
     NO_GO_BEHAVIOR_SUPPORT = "NO_GO_BEHAVIOR_SUPPORT"
     NO_GO_MISSING_NEXT_BEHAVIOR_ACTION = "NO_GO_MISSING_NEXT_BEHAVIOR_ACTION"
+    NO_GO_FIT_CONVERGENCE = "NO_GO_FIT_CONVERGENCE"
     AMBIGUOUS_TERMINATION = "AMBIGUOUS_TERMINATION"
     INVALID_DATA = "INVALID_DATA"
     FAILED = "FAILED"
@@ -83,7 +84,12 @@ class ValueEstimate:
         except ValueError as exc:
             raise ValueError(f"unknown estimate status: {self.status!r}") from exc
         if status is EstimateStatus.PASS:
-            if self.value is None or not np.isfinite(float(self.value)):
+            if (
+                self.value is None
+                or isinstance(self.value, (bool, np.bool_))
+                or not isinstance(self.value, (int, float, np.integer, np.floating))
+                or not np.isfinite(float(self.value))
+            ):
                 raise ValueError("PASS requires a finite value")
             object.__setattr__(self, "value", float(self.value))
         elif self.value is not None:
@@ -345,6 +351,22 @@ class TransitionBatch:
                 EstimateStatus.AMBIGUOUS_TERMINATION.value,
                 "horizon truncation does not occur at native t=H-1",
             )
+        if self.timestep_provenance == "episode_offsets":
+            for start, stop in zip(self.episode_offsets[:-1], self.episode_offsets[1:]):
+                if stop - start >= horizon:
+                    continue
+                last = int(stop - 1)
+                has_physical_boundary = bool(
+                    self.terminated[last]
+                    or self.truncation_reason[last] == "environment"
+                    or self.dataset_cut[last]
+                )
+                if not has_physical_boundary:
+                    raise DataValidationError(
+                        EstimateStatus.INVALID_DATA.value,
+                        "short episode_offsets group lacks termination or dataset-cut evidence; "
+                        "compressed 0..N-1 timesteps cannot stand in for native time",
+                    )
         no_bootstrap = (
             self.terminated
             | (self.native_timestep == horizon - 1)
@@ -408,6 +430,36 @@ def policy_id(provider: CandidateActionProvider) -> str:
     return value
 
 
+def finite_horizon_method_id(family: str, gamma: float, horizon: int) -> str:
+    """Derive one method identity from the protocol actually being executed."""
+
+    if not str(family):
+        raise ValueError("method family must be non-empty")
+    if isinstance(gamma, (bool, np.bool_)) or not isinstance(
+        gamma, (int, float, np.integer, np.floating)
+    ) or not np.isfinite(float(gamma)):
+        raise ValueError("gamma must be a finite number")
+    if isinstance(horizon, (bool, np.bool_)) or int(horizon) != horizon or int(horizon) <= 0:
+        raise ValueError("horizon must be a positive integer")
+    numeric_gamma = float(gamma)
+    if numeric_gamma == 1.0:
+        gamma_token = "1000"
+    else:
+        text = np.format_float_positional(numeric_gamma, unique=True, trim="-")
+        whole, _, fraction = text.partition(".")
+        gamma_token = f"{whole}{fraction.ljust(2, '0')}"
+    return f"{family}_G{gamma_token}_H{int(horizon)}"
+
+
+def finite_horizon_value_convention(gamma: float, horizon: int) -> str:
+    """Canonical raw-return convention paired with a dynamic method ID."""
+
+    # Reuse method-ID validation and preserve the full unique float spelling.
+    finite_horizon_method_id("VALUE", gamma, horizon)
+    gamma_text = np.format_float_positional(float(gamma), unique=True, trim="-")
+    return f"J_gamma={gamma_text}_H={int(horizon)}_raw"
+
+
 def validate_action_keys(keys: Any, n_rows: int) -> np.ndarray:
     """Validate scalar seeds or structured integer keys for a row batch."""
 
@@ -468,7 +520,10 @@ def behavior_log_prob(
 ) -> np.ndarray:
     """Evaluate an exact conditional density without accepting silent clipping."""
 
-    if not bool(getattr(provider, "exact", False)):
+    # Do not accept truthy metadata such as ``"false"`` or ``1`` as a
+    # scientific capability declaration.  The provider must expose the
+    # literal boolean value True; production authority is handled separately.
+    if getattr(provider, "exact", False) is not True:
         raise DataValidationError(
             EstimateStatus.NO_GO_EXISTING_LOG_DENSITY.value,
             "behavior density is absent or not exact for the logged distribution",
@@ -499,6 +554,8 @@ __all__ = [
     "ValueEstimate",
     "behavior_log_prob",
     "candidate_actions",
+    "finite_horizon_method_id",
+    "finite_horizon_value_convention",
     "policy_id",
     "policy_semantics",
     "validate_action_keys",

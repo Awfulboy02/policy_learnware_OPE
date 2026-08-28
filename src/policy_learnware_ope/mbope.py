@@ -26,23 +26,26 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
+from .core import (
+    DataValidationError,
+    EstimateStatus,
+    TransitionBatch,
+    ValueEstimate,
+    candidate_actions,
+    finite_horizon_method_id,
+    finite_horizon_value_convention,
+    policy_id,
+    policy_semantics,
+)
+
 
 DOPE_STYLE_MB_FF_ID = "DOPE_STYLE_MB_FF_G099_H1000"
 AR_MBOPE_ID = "AR_MBOPE_G099_H1000"
 ETM_MBOPE_ID = "ETM_MBOPE_G099_H1000"
-VALUE_CONVENTION = "J_gamma=0.99_H=1000_raw"
 
 
 def _value_convention(gamma: float, horizon: int) -> str:
-    return f"J_gamma={float(gamma):.6g}_H={int(horizon)}_raw"
-
-
-def _field(batch: Any, singular: str, plural: str | None = None) -> Any:
-    if hasattr(batch, singular):
-        return getattr(batch, singular)
-    if plural is not None and hasattr(batch, plural):
-        return getattr(batch, plural)
-    raise ValueError(f"transition batch is missing {singular}")
+    return finite_horizon_value_convention(gamma, horizon)
 
 
 def _matrix(value: Any, name: str) -> np.ndarray:
@@ -51,13 +54,6 @@ def _matrix(value: Any, name: str) -> np.ndarray:
         array = array[:, None]
     if array.ndim != 2 or array.shape[1] == 0:
         raise ValueError(f"{name} must have shape (n, d)")
-    return array
-
-
-def _vector(value: Any, name: str, *, dtype: Any = float) -> np.ndarray:
-    array = np.asarray(value, dtype=dtype).reshape(-1)
-    if array.ndim != 1:
-        raise ValueError(f"{name} must be one-dimensional")
     return array
 
 
@@ -74,66 +70,61 @@ class _BatchData:
     environment_terminal: np.ndarray
     valid: np.ndarray
     timestep_provenance: str
+    physical_membership_sha256: str
+    source_digest: str | None
 
 
-def _extract_batch(batch: Any, horizon: int) -> _BatchData:
-    observation = _matrix(_field(batch, "observation", "observations"), "observation")
-    action = _matrix(_field(batch, "action", "actions"), "action")
-    reward = _vector(_field(batch, "reward", "rewards"), "reward")
-    next_observation = _matrix(
-        _field(batch, "next_observation", "next_observations"), "next_observation"
-    )
-    terminated = _vector(_field(batch, "terminated"), "terminated", dtype=bool)
-    truncated = _vector(_field(batch, "truncated"), "truncated", dtype=bool)
-    dataset_cut = _vector(_field(batch, "dataset_cut"), "dataset_cut", dtype=bool)
-    native_timestep = _vector(
-        _field(batch, "native_timestep"), "native_timestep", dtype=np.int64
-    )
-    size = len(observation)
-    arrays = (
-        action,
-        reward,
-        next_observation,
-        terminated,
-        truncated,
-        dataset_cut,
-        native_timestep,
-    )
-    if any(len(array) != size for array in arrays):
-        raise ValueError("transition fields have inconsistent row counts")
-    if next_observation.shape != observation.shape:
-        raise ValueError("next_observation must match observation shape")
-    if size == 0:
-        raise ValueError("transition batch is empty")
-    provenance = str(getattr(batch, "timestep_provenance", ""))
-    if provenance not in {"episode_offsets", "native_indices"}:
-        raise ValueError(
-            "native_timestep provenance must be episode_offsets or native_indices; "
-            "compressed/subsample ordinals and unknown provenance fail closed"
+def _membership_digest(batch: TransitionBatch) -> str:
+    digest = sha256()
+    for name in (
+        "observation",
+        "action",
+        "reward",
+        "next_observation",
+        "terminated",
+        "truncated",
+        "dataset_cut",
+        "native_timestep",
+        "episode_id",
+        "episode_offsets",
+        "truncation_reason",
+    ):
+        value = np.asarray(getattr(batch, name))
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update(str(value.dtype).encode("ascii") + b"\0")
+        digest.update(np.asarray(value.shape, dtype="<i8").tobytes())
+        digest.update(np.ascontiguousarray(value).tobytes())
+    digest.update(batch.timestep_provenance.encode("utf-8"))
+    digest.update(str(batch.source_digest or "").encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _extract_batch(batch: TransitionBatch, horizon: int) -> _BatchData:
+    if not isinstance(batch, TransitionBatch):
+        raise DataValidationError(
+            EstimateStatus.INVALID_DATA.value,
+            "model-based estimators require a core.TransitionBatch so physical "
+            "membership and termination semantics cannot bypass validation",
         )
-    if np.any(native_timestep < 0):
-        raise ValueError("native_timestep must be non-negative")
-    finite = (
-        np.isfinite(observation).all(axis=1)
-        & np.isfinite(action).all(axis=1)
-        & np.isfinite(reward)
-        & np.isfinite(next_observation).all(axis=1)
-    )
-    if np.any(native_timestep >= int(horizon)):
-        raise ValueError("native_timestep lies outside the configured finite horizon")
-    reasons = np.asarray(
-        getattr(batch, "truncation_reason", np.full(size, "none")), dtype=str
-    ).reshape(-1)
-    if len(reasons) != size:
-        raise ValueError("truncation_reason must match transition rows")
+    # Reuse the canonical finite-horizon validation even though a transition
+    # model does not consume the returned Bellman mask.  This catches invalid
+    # horizon truncations while preserving dataset cuts as non-terminals.
+    batch.bootstrap_mask(horizon)
+    observation = batch.observation
+    action = batch.action
+    reward = batch.reward
+    next_observation = batch.next_observation
+    terminated = batch.terminated
+    truncated = batch.truncated
+    dataset_cut = batch.dataset_cut
+    native_timestep = batch.native_timestep
+    reasons = batch.truncation_reason
     # Dataset cuts are artificial membership boundaries, not terminals.  Their
     # observed (s,a,r,s') rows remain valid for a transition model.  Native
     # terminations and environment truncations stop model rollouts; time-limit
     # truncations are handled solely by the configured finite horizon.
     environment_terminal = terminated | (reasons == "environment")
-    valid = finite
-    if not np.any(valid):
-        raise ValueError("no valid native finite-horizon transitions remain")
+    valid = np.ones(len(batch), dtype=bool)
     return _BatchData(
         observation,
         action,
@@ -145,7 +136,9 @@ def _extract_batch(batch: Any, horizon: int) -> _BatchData:
         native_timestep,
         environment_terminal,
         valid,
-        provenance,
+        batch.timestep_provenance,
+        _membership_digest(batch),
+        batch.source_digest,
     )
 
 
@@ -159,15 +152,21 @@ def _mix64(value: int) -> int:
     return (value ^ (value >> 31)) & mask
 
 
-def _keys(value: Any, rows: int, name: str) -> np.ndarray:
-    array = np.asarray(value, dtype=np.uint64)
-    if array.ndim == 0:
-        array = array.reshape(1)
-    else:
-        array = array.reshape(-1)
-    if len(array) != rows:
+def _key_array(value: Any, name: str, *, rows: int | None = None) -> np.ndarray:
+    raw = np.asarray(value)
+    if raw.ndim == 0:
+        raw = raw.reshape(1)
+    elif raw.ndim != 1:
+        raise ValueError(f"{name} must be a one-dimensional integer array")
+    if raw.dtype.kind not in "iu" or raw.dtype.kind == "b":
+        raise ValueError(f"{name} must contain integers; implicit numeric casts are forbidden")
+    if raw.dtype.kind == "i" and np.any(raw < 0):
+        raise ValueError(f"{name} must contain non-negative integers")
+    if rows is not None and len(raw) != rows:
         raise ValueError(f"{name} must provide exactly one uint64 key per row")
-    return array
+    if len(raw) == 0:
+        raise ValueError(f"{name} must not be empty")
+    return np.asarray(raw, dtype=np.uint64)
 
 
 def _seed_from_keys(keys: np.ndarray, salt: int) -> int:
@@ -618,40 +617,21 @@ class _ContrastiveEnergyModel:
         return self.y_scaler.inverse(y)
 
 
-def _actor_id(actor: Any) -> str:
-    return str(getattr(actor, "policy_id", getattr(actor, "candidate_id", "unknown")))
-
-
-def _actor_semantics(actor: Any) -> str:
-    semantics = getattr(actor, "semantics", getattr(actor, "policy_semantics", "unspecified"))
-    return str(getattr(semantics, "value", semantics))
-
-
 def _sample_actor(
     actor: Any,
     observations: np.ndarray,
     native_timestep: np.ndarray,
     keys: np.ndarray,
 ) -> np.ndarray:
-    if hasattr(actor, "sample_actions"):
-        from .core import candidate_actions
-
-        actions = candidate_actions(
-            actor,
-            observations,
-            native_timestep,
-            keys=np.asarray(keys, dtype=np.uint64),
-            require_deterministic=False,
-        )
-    elif hasattr(actor, "actions"):
-        actions = actor.actions(
-            _actor_id(actor),
-            observations,
-            action_keys=np.asarray(keys, dtype=np.uint64),
-            require_deterministic=False,
-        )
-    else:
+    if not hasattr(actor, "sample_actions"):
         raise TypeError("candidate actor must implement sample_actions(..., keys=...)")
+    actions = candidate_actions(
+        actor,
+        observations,
+        native_timestep,
+        keys=np.asarray(keys, dtype=np.uint64),
+        require_deterministic=False,
+    )
     actions = _matrix(actions, "actor actions")
     if len(actions) != len(observations) or not np.isfinite(actions).all():
         raise ValueError("actor returned invalid actions")
@@ -659,15 +639,11 @@ def _sample_actor(
 
 
 def _make_value_estimate(**fields: Any) -> Any:
-    # Import lazily so this module stays importable while the tiny companion
-    # repository is assembled in parallel.
-    from .core import ValueEstimate
-
     return ValueEstimate(**fields)
 
 
 class _BaseMBOPE:
-    method_id = "BASE_MBOPE"
+    method_family = "BASE_MBOPE"
     identity: Mapping[str, Any] = {}
     member_count = 1
 
@@ -681,12 +657,36 @@ class _BaseMBOPE:
         termination_function: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
         learn_termination: bool = False,
     ) -> None:
-        if not 0.0 <= gamma <= 1.0:
+        if (
+            isinstance(gamma, (bool, np.bool_))
+            or not isinstance(gamma, (int, float, np.integer, np.floating))
+            or not np.isfinite(float(gamma))
+            or not 0.0 <= float(gamma) <= 1.0
+        ):
             raise ValueError("gamma must be in [0, 1]")
-        if horizon <= 0 or rollouts_per_initial <= 0:
-            raise ValueError("horizon and rollouts_per_initial must be positive")
+        if (
+            isinstance(horizon, (bool, np.bool_))
+            or int(horizon) != horizon
+            or int(horizon) <= 0
+            or isinstance(rollouts_per_initial, (bool, np.bool_))
+            or int(rollouts_per_initial) != rollouts_per_initial
+            or int(rollouts_per_initial) <= 0
+        ):
+            raise ValueError("horizon and rollouts_per_initial must be positive integers")
+        if (
+            isinstance(ridge, (bool, np.bool_))
+            or not isinstance(ridge, (int, float, np.integer, np.floating))
+            or not np.isfinite(float(ridge))
+            or float(ridge) <= 0.0
+        ):
+            raise ValueError("ridge must be finite and positive")
+        if not isinstance(learn_termination, (bool, np.bool_)):
+            raise ValueError("learn_termination must be boolean")
         self.gamma = float(gamma)
         self.horizon = int(horizon)
+        self.method_id = finite_horizon_method_id(
+            self.method_family, self.gamma, self.horizon
+        )
         self.rollouts_per_initial = int(rollouts_per_initial)
         self.ridge = float(ridge)
         if termination_function is not None and learn_termination:
@@ -704,6 +704,9 @@ class _BaseMBOPE:
             if self.termination_function is not None
             else "horizon_only"
         )
+        self._reset_fit_state()
+
+    def _reset_fit_state(self) -> None:
         self._actor: Any = None
         self._model: Any = None
         self._termination: _TerminationHead | None = None
@@ -716,20 +719,23 @@ class _BaseMBOPE:
         self._behavior_action_mean: np.ndarray | None = None
         self._behavior_action_scale: np.ndarray | None = None
         self._timestep_provenance = ""
+        self._physical_membership_sha256 = ""
+        self._source_digest: str | None = None
 
     def _build_model(self, rng: np.random.Generator) -> Any:
         raise NotImplementedError
 
-    def fit(self, batch: Any, candidate: Any, *, fit_keys: Any) -> "_BaseMBOPE":
+    def fit(
+        self, batch: TransitionBatch, candidate: Any, *, fit_keys: Any
+    ) -> "_BaseMBOPE":
+        # A failed refit must invalidate the previous estimator instead of
+        # leaving a mixture of old provenance and a newly overwritten model.
+        self._reset_fit_state()
         started = perf_counter()
         data = _extract_batch(batch, self.horizon)
-        from .core import policy_id, policy_semantics
-
         policy_id(candidate)
         policy_semantics(candidate)
-        fit_key_array = np.asarray(fit_keys, dtype=np.uint64).reshape(-1)
-        if len(fit_key_array) == 0:
-            raise ValueError("fit_keys must contain at least one explicit uint64 key")
+        fit_key_array = _key_array(fit_keys, "fit_keys")
         rng = np.random.default_rng(_seed_from_keys(fit_key_array, 0x4D424F5045))
         valid = data.valid
         inputs = _transition_inputs(
@@ -745,12 +751,13 @@ class _BaseMBOPE:
             ],
             axis=1,
         )
-        self._model = self._build_model(rng)
-        self._model.fit(inputs, targets, rng)
+        model = self._build_model(rng)
+        model.fit(inputs, targets, rng)
         native_environment_termination = bool(np.any(data.environment_terminal[valid]))
+        termination: _TerminationHead | None = None
         if self.learn_termination:
-            self._termination = _TerminationHead(self.ridge)
-            self._termination.fit(inputs, data.environment_terminal[valid], rng)
+            termination = _TerminationHead(self.ridge)
+            termination.fit(inputs, data.environment_terminal[valid], rng)
         elif self.termination_function is None and native_environment_termination:
             from .core import DataValidationError, EstimateStatus
 
@@ -759,18 +766,14 @@ class _BaseMBOPE:
                 "native environment termination requires a shared known functional or "
                 "a separately identified learn_termination=True variant",
             )
-        self._actor = candidate
-        self._observation_dim = data.observation.shape[1]
-        self._action_dim = data.action.shape[1]
-        self._behavior_action_mean = np.mean(data.action[valid], axis=0)
-        self._behavior_action_scale = np.std(data.action[valid], axis=0)
-        self._behavior_action_scale[self._behavior_action_scale < 1e-6] = 1.0
-        self._fit_rows = int(np.sum(valid))
-        self._fit_key_digest = _key_digest(fit_key_array)
-        self._timestep_provenance = data.timestep_provenance
-        self._fit_seconds = perf_counter() - started
-        self._fit_diagnostics = {
-            **self._model.diagnostics,
+        behavior_action_mean = np.mean(data.action[valid], axis=0)
+        behavior_action_scale = np.std(data.action[valid], axis=0)
+        behavior_action_scale[behavior_action_scale < 1e-6] = 1.0
+        fit_rows = int(np.sum(valid))
+        fit_key_digest = _key_digest(fit_key_array)
+        fit_seconds = perf_counter() - started
+        fit_diagnostics = {
+            **model.diagnostics,
             "method_identity": dict(self.identity),
             "native_timestep_used": True,
             "timestep_provenance": data.timestep_provenance,
@@ -779,9 +782,27 @@ class _BaseMBOPE:
             "truncation_rows_not_relabeled_terminal": int(np.sum(data.truncated & valid)),
             "termination_contract": self._termination_mode,
             "learned_termination_method_suffix": self.learn_termination,
-            "fit_rows": self._fit_rows,
+            "fit_rows": fit_rows,
+            "physical_membership_sha256": data.physical_membership_sha256,
             "actor_queries_during_fit": 0,
         }
+
+        # Publish fitted state only after every gate and derived field above
+        # has succeeded.
+        self._model = model
+        self._termination = termination
+        self._actor = candidate
+        self._observation_dim = data.observation.shape[1]
+        self._action_dim = data.action.shape[1]
+        self._behavior_action_mean = behavior_action_mean
+        self._behavior_action_scale = behavior_action_scale
+        self._fit_rows = fit_rows
+        self._fit_key_digest = fit_key_digest
+        self._timestep_provenance = data.timestep_provenance
+        self._physical_membership_sha256 = data.physical_membership_sha256
+        self._source_digest = data.source_digest
+        self._fit_seconds = fit_seconds
+        self._fit_diagnostics = fit_diagnostics
         return self
 
     def estimate(
@@ -797,15 +818,21 @@ class _BaseMBOPE:
         actor = self._actor if candidate is None else candidate
         if actor is None:
             raise ValueError("a candidate actor is required")
+        actor_id = policy_id(actor)
+        actor_semantics = policy_semantics(actor).value
         initial = _matrix(initial_observations, "initial_observations")
         if initial.shape[1] != self._observation_dim or not np.isfinite(initial).all():
             raise ValueError("initial observation ABI differs from fitted data")
-        root_keys = _keys(keys, len(initial), "keys")
-        initial_time = np.asarray(initial_timestep, dtype=np.int64)
-        if initial_time.ndim == 0:
-            initial_time = np.full(len(initial), int(initial_time), dtype=np.int64)
+        root_keys = _key_array(keys, "keys", rows=len(initial))
+        initial_time_raw = np.asarray(initial_timestep)
+        if initial_time_raw.dtype.kind not in "iu" or initial_time_raw.dtype.kind == "b":
+            raise ValueError("initial_timestep must contain integers")
+        if initial_time_raw.ndim == 0:
+            initial_time = np.full(len(initial), int(initial_time_raw), dtype=np.int64)
         else:
-            initial_time = initial_time.reshape(-1)
+            if initial_time_raw.ndim != 1:
+                raise ValueError("initial_timestep must be scalar or one-dimensional")
+            initial_time = initial_time_raw.astype(np.int64, copy=False)
         if len(initial_time) != len(initial):
             raise ValueError("initial_timestep must be scalar or match initial observations")
         if np.any(initial_time < 0) or np.any(initial_time >= self.horizon):
@@ -913,18 +940,21 @@ class _BaseMBOPE:
         support = {
             "behavior_density_required": False,
             "kind": "learned_model_rollout_global_behavior_action_z",
-            "actor_semantics": _actor_semantics(actor),
+            "actor_semantics": actor_semantics,
             "rollout_action_z_mean": action_z_sum / max(action_z_count, 1),
             "rollout_action_z_max": action_z_max,
             "support_rows": action_z_count,
         }
         provenance = {
-            "candidate_id": _actor_id(actor),
+            "candidate_id": actor_id,
             "implementation": "policy_learnware_ope.mbope",
             "fit_key_digest": self._fit_key_digest,
             "native_timestep_provenance": self._timestep_provenance,
+            "physical_membership_sha256": self._physical_membership_sha256,
+            "source_digest": self._source_digest,
             "value_convention": _value_convention(self.gamma, self.horizon),
-            "production_method_convention": VALUE_CONVENTION,
+            "scientific_role": self.identity["scientific_role"],
+            "upstream_parity_claim": "NONE",
         }
         cost = {
             "fit_seconds": float(self._fit_seconds),
@@ -947,14 +977,16 @@ class _BaseMBOPE:
 class DOPEStyleMBFFEstimator(_BaseMBOPE):
     """Project-defined feed-forward MB-OPE; DOPE is benchmark inspiration only."""
 
-    method_id = DOPE_STYLE_MB_FF_ID
+    method_family = "DOPE_STYLE_MB_FF"
     identity = {
         "family": "feed_forward_model_based_ope",
+        "scientific_role": "PROJECT_DEFINED_REFERENCE",
         "project_defined": True,
-        "implementation_scope": "EXECUTABLE_SYNTHETIC_REFERENCE",
+        "implementation_scope": "EXECUTABLE_PROJECT_REFERENCE",
         "full_2x256_SiLU_diagonal_NLL_port": False,
         "dope_is_benchmark_inspiration_not_algorithm": True,
-        "distinct_from": [AR_MBOPE_ID, ETM_MBOPE_ID],
+        "upstream_parity_claimed": False,
+        "distinct_from_families": ["AR_MBOPE", "ETM_MBOPE"],
     }
 
     def __init__(
@@ -977,6 +1009,15 @@ class DOPEStyleMBFFEstimator(_BaseMBOPE):
             termination_function=termination_function,
             learn_termination=learn_termination,
         )
+        if (
+            isinstance(ensemble_members, (bool, np.bool_))
+            or not isinstance(ensemble_members, (int, np.integer))
+            or int(ensemble_members) <= 0
+            or isinstance(hidden_dim, (bool, np.bool_))
+            or not isinstance(hidden_dim, (int, np.integer))
+            or int(hidden_dim) <= 0
+        ):
+            raise ValueError("ensemble_members and hidden_dim must be positive integers")
         self.member_count = int(ensemble_members)
         self.hidden_dim = int(hidden_dim)
 
@@ -990,15 +1031,16 @@ class DOPEStyleMBFFEstimator(_BaseMBOPE):
 class ARMBOPEEstimator(_BaseMBOPE):
     """Independent B06-inspired autoregressive MB-OPE project adaptation."""
 
-    method_id = AR_MBOPE_ID
+    method_family = "AR_MBOPE"
     identity = {
         "family": "fixed_order_autoregressive_model_based_ope",
+        "scientific_role": "PROJECT_METHOD_LEVEL_ADAPTATION_PROXY",
         "project_adaptation": True,
-        "implementation_scope": "EXECUTABLE_SYNTHETIC_REFERENCE",
-        "official_B06_architecture_parity": False,
+        "implementation_scope": "EXECUTABLE_PROJECT_REFERENCE_PROXY",
+        "upstream_parity_claimed": False,
         "training": "teacher_forcing",
         "generation": "sequential_per_dimension",
-        "distinct_from": [DOPE_STYLE_MB_FF_ID, ETM_MBOPE_ID],
+        "distinct_from_families": ["DOPE_STYLE_MB_FF", "ETM_MBOPE"],
     }
 
     def __init__(
@@ -1021,6 +1063,15 @@ class ARMBOPEEstimator(_BaseMBOPE):
             termination_function=termination_function,
             learn_termination=learn_termination,
         )
+        if (
+            isinstance(ensemble_members, (bool, np.bool_))
+            or not isinstance(ensemble_members, (int, np.integer))
+            or int(ensemble_members) <= 0
+            or isinstance(hidden_dim, (bool, np.bool_))
+            or not isinstance(hidden_dim, (int, np.integer))
+            or int(hidden_dim) <= 0
+        ):
+            raise ValueError("ensemble_members and hidden_dim must be positive integers")
         self.member_count = int(ensemble_members)
         self.hidden_dim = int(hidden_dim)
 
@@ -1034,15 +1085,16 @@ class ARMBOPEEstimator(_BaseMBOPE):
 class ETMMBOPEEstimator(_BaseMBOPE):
     """Contrastive conditional-energy transition model with Langevin rollout."""
 
-    method_id = ETM_MBOPE_ID
+    method_family = "ETM_MBOPE"
     identity = {
         "family": "contrastive_energy_transition_model_ope",
+        "scientific_role": "PROJECT_CONTRASTIVE_ENERGY_ADAPTATION_PROXY",
         "project_adaptation": True,
-        "implementation_scope": "EXECUTABLE_SYNTHETIC_REFERENCE",
-        "official_ETM_architecture_parity": False,
+        "implementation_scope": "EXECUTABLE_PROJECT_REFERENCE_PROXY",
+        "upstream_parity_claimed": False,
         "fit": "InfoNCE",
         "generation": "Langevin_energy_sampling",
-        "distinct_from": [DOPE_STYLE_MB_FF_ID, AR_MBOPE_ID],
+        "distinct_from_families": ["DOPE_STYLE_MB_FF", "AR_MBOPE"],
     }
     member_count = 1
 
@@ -1071,6 +1123,31 @@ class ETMMBOPEEstimator(_BaseMBOPE):
             termination_function=termination_function,
             learn_termination=learn_termination,
         )
+        positive_integers = {
+            "hidden_dim": hidden_dim,
+            "energy_features": energy_features,
+            "negatives": negatives,
+            "contrastive_steps": contrastive_steps,
+            "langevin_steps": langevin_steps,
+        }
+        if any(
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or int(value) <= 0
+            for value in positive_integers.values()
+        ):
+            raise ValueError("ETM dimensions and step counts must be positive integers")
+        for name, value in {
+            "learning_rate": learning_rate,
+            "langevin_step_size": langevin_step_size,
+        }.items():
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, float, np.integer, np.floating))
+                or not np.isfinite(float(value))
+                or float(value) <= 0.0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
         self.hidden_dim = int(hidden_dim)
         self.energy_features = int(energy_features)
         self.negatives = int(negatives)
@@ -1093,36 +1170,27 @@ class ETMMBOPEEstimator(_BaseMBOPE):
         )
 
 
-# Exact method-ID aliases are convenient for a deliberately tiny CLI/registry.
-DOPE_STYLE_MB_FF_G099_H1000 = DOPEStyleMBFFEstimator
-AR_MBOPE_G099_H1000 = ARMBOPEEstimator
-ETM_MBOPE_G099_H1000 = ETMMBOPEEstimator
-
-MODEL_BASED_ESTIMATORS = {
-    DOPE_STYLE_MB_FF_ID: DOPEStyleMBFFEstimator,
-    AR_MBOPE_ID: ARMBOPEEstimator,
-    ETM_MBOPE_ID: ETMMBOPEEstimator,
-}
-
-
 def make_model_based_estimator(method_id: str, **kwargs: Any) -> _BaseMBOPE:
+    # The CLI needs one selector; keeping the three-class map local avoids a
+    # second public registry and redundant exact-ID class aliases.
+    estimator_types = {
+        DOPE_STYLE_MB_FF_ID: DOPEStyleMBFFEstimator,
+        AR_MBOPE_ID: ARMBOPEEstimator,
+        ETM_MBOPE_ID: ETMMBOPEEstimator,
+    }
     try:
-        estimator = MODEL_BASED_ESTIMATORS[method_id]
+        estimator = estimator_types[method_id]
     except KeyError as exc:
         raise ValueError(f"unknown model-based method: {method_id}") from exc
     return estimator(**kwargs)
 
 
 __all__ = [
-    "AR_MBOPE_G099_H1000",
     "AR_MBOPE_ID",
     "ARMBOPEEstimator",
-    "DOPE_STYLE_MB_FF_G099_H1000",
     "DOPE_STYLE_MB_FF_ID",
     "DOPEStyleMBFFEstimator",
-    "ETM_MBOPE_G099_H1000",
     "ETM_MBOPE_ID",
     "ETMMBOPEEstimator",
-    "MODEL_BASED_ESTIMATORS",
     "make_model_based_estimator",
 ]

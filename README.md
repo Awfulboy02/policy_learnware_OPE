@@ -1,27 +1,57 @@
 # Policy Learnware OPE v0.4b
 
-Minimal companion repository for policy-library selection under target-dynamics
-shift. It estimates and ranks the same-task frozen candidate policies using a
-fixed rewarded behavior log, while keeping the v03 repository, policies,
-manifests, logs, and oracle read-only.
+Small companion repository for method-level, finite-horizon policy-selection
+experiments. The v03 repository, policy bundles, logs, manifests, and oracle
+assets remain read-only external inputs.
 
-The executable MVP includes five finite-horizon estimators, a delegated
-`RAW_DELTA_TASK5` comparator, digest-locked actor/asset bridges, ranking seals,
-post-seal metrics, and synthetic/known-MDP acceptance tests. The primary value
-convention is raw `J(gamma=0.99,H=1000)`.
+The executable synthetic MVP contains five fitted estimators:
+
+- `FH_FQE`: compact NumPy finite-horizon ridge FQE reference.
+- `FH_KMIFQE`: project adaptation used to exercise the exact-density and
+  support path; it is not an official KMIFQE reproduction.
+- `ETM_MBOPE`: project contrastive-energy adaptation/proxy, not the official
+  ETM architecture.
+- `DOPE_STYLE_MB_FF`: project-defined feed-forward model-based reference. DOPE
+  is inspiration for the benchmark design, not the name of an upstream
+  algorithm implemented here.
+- `AR_MBOPE`: B06-inspired project adaptation/proxy, kept independent from the
+  feed-forward model.
+
+Method IDs are derived from the protocol actually executed. Thus the toy run
+emits `..._G099_H5`; only a real `gamma=.99, H=1000` run may emit
+`..._G099_H1000`.
+
+`RAW_ADAPTER_FIXTURE` tests a reward-free, digest-bound TASK_5 request and
+sealed response. It uses fixture scores and is not a Raw-Delta/RKME
+implementation. Production Raw remains `NO_GO_RAW_OPERATOR_AUTHORITY` until a
+trusted export authority and reward-free membership verifier are implemented;
+this release does not expose a production Raw execution path. Live subprocess
+execution is intentionally disabled because this companion cannot yet enforce
+the old repository and assets as read-only.
 
 ```bash
 python -m pip install -e '.[test]'
-policy-learnware-ope toy --output artifacts/toy
+policy-learnware-ope toy --output artifacts/toy --seed 7
+policy-learnware-ope real-preflight --output artifacts/real-preflight.json
 pytest
 ```
 
-Production gates fail closed: sampled `0..63` ordinals are not accepted as
-native timesteps, clipped-Gaussian logs without an arbitrary-action exact
-density cannot run KMIFQE, stochastic FPO actors require explicit action keys,
-and episodic-return-only oracle files cannot be relabeled as discounted values.
+The real preflight intentionally exits nonzero and records `NO_GO` for the
+three presently missing capabilities: verified actor authority, exact
+arbitrary-action behavior density, and a per-step oracle bound to
+`J(gamma=.99,H=1000)`. Production Raw is separately `NO_GO`. No recollection,
+policy retraining, oracle rewriting, or old-asset mutation is performed.
 
-`TOY_MVP_PASS` means that each method executes a real fit/estimate path on the
-acceptance fixture. It does not claim official-code or paper-architecture
-parity, and it is not a real-asset training result; each artifact records the
-remaining production-port scope explicitly.
+Ranking seals are canonical, write-once payloads. Their SHA-256 is retained by
+a separate run manifest and must be supplied when loading or joining an oracle.
+The CLI summary also emits the run, seal, and oracle-manifest digests so a
+caller can retain them outside the artifact directory.
+The toy runner refuses a nonempty output directory, preventing a failed rerun
+from mixing newly overwritten inputs with an older sealed manifest.
+The oracle manifest independently binds context, candidate set, value
+convention, and its caller-held digest. Wall-clock measurements are attached
+only after the seal and are exported in `runtime.json` and post-join metrics.
+
+`TOY_MVP_PASS` means the method executed a real fit/estimate path on the
+synthetic fixture. It does not mean paper-level or official-code parity, and it
+does not claim that the production real-asset gates have passed.

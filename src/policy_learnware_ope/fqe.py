@@ -24,6 +24,7 @@ from .core import (
     ValueEstimate,
     behavior_log_prob,
     candidate_actions,
+    finite_horizon_method_id,
     policy_id,
     policy_semantics,
     validate_action_keys,
@@ -85,6 +86,7 @@ class FiniteHorizonFQE:
     """Time-conditioned fitted Q evaluation with a NumPy ridge critic."""
 
     method_id = FH_FQE_METHOD_ID
+    method_family = "FH_FQE"
 
     def __init__(
         self,
@@ -95,20 +97,34 @@ class FiniteHorizonFQE:
         max_iterations: int | None = None,
         tolerance: float = 1e-9,
     ) -> None:
-        if not 0.0 <= float(gamma) <= 1.0:
+        if (
+            isinstance(gamma, (bool, np.bool_))
+            or not isinstance(gamma, (int, float, np.integer, np.floating))
+            or not np.isfinite(float(gamma))
+            or not 0.0 <= float(gamma) <= 1.0
+        ):
             raise ValueError("gamma must lie in [0, 1]")
         if isinstance(horizon, bool) or int(horizon) != horizon or int(horizon) <= 0:
             raise ValueError("horizon must be a positive integer")
         if float(ridge) <= 0.0 or not np.isfinite(ridge):
             raise ValueError("ridge must be finite and positive")
-        if max_iterations is None:
-            max_iterations = max(int(horizon) + 1, 50)
-        if isinstance(max_iterations, bool) or int(max_iterations) != max_iterations or int(max_iterations) <= 0:
-            raise ValueError("max_iterations must be a positive integer")
         if float(tolerance) <= 0.0 or not np.isfinite(tolerance):
             raise ValueError("tolerance must be finite and positive")
+        if max_iterations is None:
+            if 0.0 < float(gamma) < 1.0:
+                contraction_iterations = int(
+                    np.ceil(np.log(float(tolerance)) / np.log(float(gamma)))
+                ) + 1
+            else:
+                contraction_iterations = int(horizon) + 1
+            max_iterations = max(int(horizon) + 1, contraction_iterations, 50)
+        if isinstance(max_iterations, bool) or int(max_iterations) != max_iterations or int(max_iterations) <= 0:
+            raise ValueError("max_iterations must be a positive integer")
         self.gamma = float(gamma)
         self.horizon = int(horizon)
+        self.method_id = finite_horizon_method_id(
+            self.method_family, self.gamma, self.horizon
+        )
         self.ridge = float(ridge)
         self.max_iterations = int(max_iterations)
         self.tolerance = float(tolerance)
@@ -139,6 +155,11 @@ class FiniteHorizonFQE:
         start = perf_counter()
         self._candidate = candidate
         try:
+            if not isinstance(batch, TransitionBatch):
+                raise DataValidationError(
+                    EstimateStatus.INVALID_DATA.value,
+                    "FQE requires core.TransitionBatch so native time and masks cannot bypass validation",
+                )
             self._candidate_id = policy_id(candidate)
             keys = validate_action_keys(fit_keys, len(batch))
             semantics = policy_semantics(candidate)
@@ -161,7 +182,7 @@ class FiniteHorizonFQE:
             self._close_gate(status, exc.detail)
         finally:
             self._cost["fit_seconds"] = float(perf_counter() - start)
-            self._cost["fit_transitions"] = int(len(batch))
+            self._cost["fit_transitions"] = int(len(batch)) if isinstance(batch, TransitionBatch) else 0
         return self
 
     def _base_provenance(self, batch: TransitionBatch, semantics: PolicySemantics) -> None:
@@ -286,7 +307,12 @@ class FiniteHorizonFQE:
             }
         )
         if not converged:
-            self._diagnostics["convergence_warning"] = "maximum iterations reached"
+            self._diagnostics["failed_closed"] = True
+            self._close_gate(
+                EstimateStatus.NO_GO_FIT_CONVERGENCE,
+                f"ridge FQE did not converge within {self.max_iterations} iterations",
+            )
+            return
         self._fitted = True
 
     def _measure_action_support(
@@ -334,13 +360,15 @@ class FiniteHorizonFQE:
         if observations.ndim != 2 or len(observations) == 0 or not np.all(np.isfinite(observations)):
             raise ValueError("initial_observations must be a non-empty finite 2-D matrix")
         checked_keys = validate_action_keys(keys, len(observations))
-        if np.isscalar(initial_timestep):
-            times = np.full(len(observations), int(initial_timestep), dtype=np.int64)
-        else:
-            raw_times = np.asarray(initial_timestep)
-            if raw_times.shape != (len(observations),) or raw_times.dtype.kind not in "iu":
-                raise ValueError("initial_timestep must be an integer scalar or one value per state")
+        raw_times = np.asarray(initial_timestep)
+        if raw_times.dtype.kind not in "iu" or raw_times.dtype.kind == "b":
+            raise ValueError("initial_timestep must contain integers")
+        if raw_times.ndim == 0:
+            times = np.full(len(observations), int(raw_times), dtype=np.int64)
+        elif raw_times.shape == (len(observations),):
             times = raw_times.astype(np.int64)
+        else:
+            raise ValueError("initial_timestep must be an integer scalar or one value per state")
         if np.any(times < 0) or np.any(times >= self.horizon):
             raise ValueError("initial_timestep lies outside the finite horizon")
         if self._gate is not None:
@@ -401,6 +429,7 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
     """
 
     method_id = FH_KMIFQE_METHOD_ID
+    method_family = "FH_KMIFQE"
 
     def __init__(
         self,
@@ -443,6 +472,11 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
         start = perf_counter()
         self._candidate = candidate
         try:
+            if not isinstance(batch, TransitionBatch):
+                raise DataValidationError(
+                    EstimateStatus.INVALID_DATA.value,
+                    "KMIFQE requires core.TransitionBatch so native time and masks cannot bypass validation",
+                )
             self._candidate_id = policy_id(candidate)
             keys = validate_action_keys(fit_keys, len(batch))
             try:
@@ -453,15 +487,18 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
             self._provenance.update(
                 {
                     "implementation": "numpy_kernel_importance_weighted_time_ridge_fqe",
+                    "method_identity": "KMIFQE_PROJECT_ADAPTATION",
+                    "official_parity": False,
+                    "faithfulness_scope": "synthetic finite-horizon project fixture",
                     "density_id": str(getattr(behavior_density, "density_id", "")),
-                    "density_exact": bool(getattr(behavior_density, "exact", False)),
+                    "density_exact": getattr(behavior_density, "exact", False) is True,
                     "kernel": "gaussian_on_standardized_next_action",
                     "metric_learning_scope": "diagonal_logged_action_standardization",
                     "full_B20_Hessian_metric_port": "PENDING_REAL_ASSET_PHASE",
                     "importance_weight": "K(a_next_behavior,pi(s_next))/mu(a_next_behavior|s_next)",
                 }
             )
-            if not bool(getattr(behavior_density, "exact", False)):
+            if getattr(behavior_density, "exact", False) is not True:
                 self._close_gate(
                     EstimateStatus.NO_GO_EXISTING_LOG_DENSITY,
                     "KMIFQE requires exact behavior density; clipped-Gaussian existing logs do not provide it",
@@ -498,7 +535,7 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
             self._close_gate(status, exc.detail)
         finally:
             self._cost["fit_seconds"] = float(perf_counter() - start)
-            self._cost["fit_transitions"] = int(len(batch))
+            self._cost["fit_transitions"] = int(len(batch)) if isinstance(batch, TransitionBatch) else 0
         return self
 
     def _kernel_importance_weights(
@@ -566,17 +603,21 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
         if not np.all(np.isfinite(active_weight)) or float(np.sum(active_weight)) <= 0.0:
             self._close_gate(EstimateStatus.NO_GO_BEHAVIOR_SUPPORT, "kernel importance weights are degenerate")
             return None
+        active_weight /= np.mean(active_weight)
+        ess = float(
+            np.square(np.sum(active_weight)) / np.sum(np.square(active_weight))
+        )
+        active_count = int(np.sum(active))
+        ess_fraction = ess / active_count
         weight[active] = active_weight
         weight /= np.mean(weight)
-        ess = float(np.square(np.sum(weight)) / np.sum(np.square(weight)))
-        ess_fraction = ess / len(weight)
         self._support = {
             "ess": ess,
             "ess_fraction": ess_fraction,
-            "active_rows": int(np.sum(active)),
+            "active_rows": active_count,
             "kernel_bandwidth": bandwidth,
-            "weight_min": float(np.min(weight)),
-            "weight_max": float(np.max(weight)),
+            "active_weight_min": float(np.min(active_weight)),
+            "active_weight_max": float(np.max(active_weight)),
             "target_log_density_min": float(np.min(log_target)),
             "target_log_density_mean": float(np.mean(log_target)),
             "behavior_log_density_min": float(np.min(log_behavior)),

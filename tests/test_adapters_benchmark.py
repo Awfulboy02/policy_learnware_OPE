@@ -4,7 +4,6 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import subprocess
-import sys
 
 import numpy as np
 import pytest
@@ -14,16 +13,14 @@ from policy_learnware_ope.adapters import (
     FrozenRepoAuthority,
     GateClosed,
     InProcessActorProvider,
+    RAW_QUERY_SCHEMA,
+    RAW_PROJECT_METHOD_ID,
+    RAW_REQUEST_SCHEMA,
+    RAW_RESPONSE_SCHEMA,
     RawDeltaTask5Adapter,
-    SubprocessActorProvider,
+    SealedRawOperator,
     census_real_assets,
     sha256_file,
-)
-from policy_learnware_ope.benchmark import (
-    export_metrics,
-    join_oracle_and_score,
-    load_ranking_seal,
-    seal_ranking,
 )
 
 
@@ -102,26 +99,80 @@ def test_keyed_stochastic_actor_is_reproducible_and_fails_deterministic_gate():
         bound.sample_actions(observations, times, keys=keys),
         first,
     )
+    for invalid_keys in (np.asarray([1.5, 2.5]), np.asarray([-1, 2])):
+        with pytest.raises(GateClosed, match="integer|non-negative"):
+            provider.actions(
+                authority.candidate_id,
+                observations,
+                native_timestep=times,
+                action_keys=invalid_keys,
+            )
 
 
 def test_raw_task5_delegates_without_reimplementing_operator():
     delegate = ToyRawDelegate()
-    adapter = RawDeltaTask5Adapter(delegate)
+    with pytest.raises(GateClosed, match="NO_GO_RAW_OPERATOR_AUTHORITY"):
+        RawDeltaTask5Adapter(delegate)
+    adapter = RawDeltaTask5Adapter(delegate, method_id="RAW_ADAPTER_FIXTURE")
     candidate_tasks = {f"candidate-{index}": "TASK" for index in range(5)}
     candidate_tasks["other-task"] = "OTHER"
     scores = adapter.score(
         context_id="ctx",
         task_id="TASK",
         candidate_tasks=candidate_tasks,
-        query_artifact="opaque-query.npz",
+        query_artifact_digest="d" * 64,
         membership_digest="e" * 64,
     )
     expected = {candidate: float(index) for index, candidate in enumerate(sorted(scores))}
     assert scores == expected
     request = delegate.requests[0]
-    assert request["reward_visible"] is False
-    assert request["candidate_actions_visible"] is False
+    assert request["schema"] == RAW_REQUEST_SCHEMA
+    assert request["method_id"] == "RAW_ADAPTER_FIXTURE"
+    assert request["query"] == {
+        "schema": RAW_QUERY_SCHEMA,
+        "artifact_sha256": "d" * 64,
+        "fields": [
+            "observation",
+            "action",
+            "next_observation",
+            "native_timestep",
+            "episode_offsets",
+        ],
+        "forbidden_fields": ["reward", "oracle", "candidate_action"],
+    }
     assert request["candidate_ids"] == sorted(scores)
+
+    with pytest.raises(GateClosed, match="reward-free query schema"):
+        adapter.score(
+            context_id="ctx",
+            task_id="TASK",
+            candidate_tasks=candidate_tasks,
+            query_artifact_digest="d" * 64,
+            membership_digest="e" * 64,
+            query_schema="ambiguous-query.v0",
+        )
+
+
+@pytest.mark.parametrize("invalid_score", [True, "1.25"])
+def test_raw_adapter_rejects_bool_and_numeric_string_scores(invalid_score):
+    class InvalidRawDelegate:
+        def scores(self, request):
+            return {
+                candidate: invalid_score if index == 0 else float(index)
+                for index, candidate in enumerate(request["candidate_ids"])
+            }
+
+    adapter = RawDeltaTask5Adapter(
+        InvalidRawDelegate(), method_id="RAW_ADAPTER_FIXTURE"
+    )
+    with pytest.raises(GateClosed, match="must be a JSON number"):
+        adapter.score(
+            context_id="ctx",
+            task_id="TASK",
+            candidate_tasks={f"candidate-{index}": "TASK" for index in range(5)},
+            query_artifact_digest="d" * 64,
+            membership_digest="e" * 64,
+        )
 
 
 def test_frozen_repo_authority_detects_commit_and_source_drift(tmp_path: Path):
@@ -154,68 +205,13 @@ def test_frozen_repo_authority_detects_commit_and_source_drift(tmp_path: Path):
         authority.verify()
 
 
-def test_digest_locked_subprocess_actor_round_trip(tmp_path: Path):
-    repo = tmp_path / "actor-repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.email", "fixture@example.com"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repo, check=True)
-    service = repo / "actor_service.py"
-    service.write_text(
-        "import json, sys\n"
-        "request = json.load(sys.stdin)\n"
-        "actions = [[row[0] + (int(key) % 7) / 100.0] for row, key in "
-        "zip(request['observations'], request['action_keys'])]\n"
-        "print(json.dumps({'candidate_id': request['candidate_id'], "
-        "'candidate_digest': request['candidate_digest'], "
-        "'authority_sha256': request['authority_sha256'], "
-        "'action_abi': request['action_abi'], 'actions': actions}))\n",
-        encoding="utf-8",
-    )
-    subprocess.run(["git", "add", "actor_service.py"], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-qm", "actor service"], cwd=repo, check=True)
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
-    ).stdout.strip()
-    tree = subprocess.run(
-        ["git", "rev-parse", "HEAD^{tree}"], cwd=repo, check=True, text=True, capture_output=True
-    ).stdout.strip()
-    repo_authority = FrozenRepoAuthority(
-        repo,
-        commit,
-        {"actor_service.py": sha256_file(service)},
-        tree_digest=tree,
-    )
-    authority = ActorAuthority(
-        candidate_id="candidate-locked",
-        candidate_digest="a" * 64,
-        task_id="TASK",
-        observation_dim=2,
-        action_dim=1,
-        observation_abi="obs-v1",
-        action_abi="act-v1",
-        policy_semantics="stochastic_keyed",
-        normalizer_digest="b" * 64,
-        action_scaling_digest="c" * 64,
-        repo_commit=commit,
-        repo_tree_digest=tree,
-        upstream_runtime_commit="d" * 40,
-        source_digest=sha256_file(service),
-        dependency_lock_digest="e" * 64,
-    )
-    provider = SubprocessActorProvider(
-        {authority.candidate_id: authority},
-        [sys.executable, "actor_service.py"],
-        cwd=repo,
-        repo_authority=repo_authority,
-    ).bind(authority.candidate_id)
-    observation = np.asarray([[1.0, 2.0], [3.0, 4.0]])
-    timestep = np.asarray([0, 1], dtype=np.int64)
-    keys = np.asarray([8, 10], dtype=np.uint64)
-    np.testing.assert_allclose(
-        provider.sample_actions(observation, timestep, keys=keys),
-        [[1.01], [3.03]],
-    )
+def test_production_raw_and_self_promoted_identity_remain_no_go():
+    with pytest.raises(GateClosed, match="production Raw is deferred"):
+        RawDeltaTask5Adapter(ToyRawDelegate(), method_id=RAW_PROJECT_METHOD_ID)
+    with pytest.raises(GateClosed, match="unsupported Raw method identity"):
+        RawDeltaTask5Adapter(
+            ToyRawDelegate(), method_id="RAW_DELTA_TASK5_OFFICIAL_PARITY"
+        )
 
 
 def test_census_rejects_compressed_timestep_unknown_density_and_episodic_oracle(tmp_path: Path):
@@ -229,6 +225,8 @@ def test_census_rejects_compressed_timestep_unknown_density_and_episodic_oracle(
         next_observation=np.zeros((count, 2)),
         terminated=np.zeros(count, dtype=bool),
         truncated=np.zeros(count, dtype=bool),
+        dataset_cut=np.zeros(count, dtype=bool),
+        episode_id=np.zeros(count, dtype=np.int64),
         episode_offsets=np.asarray([0, count]),
         native_timestep=np.arange(count),
     )
@@ -241,70 +239,399 @@ def test_census_rejects_compressed_timestep_unknown_density_and_episodic_oracle(
         oracle_path=oracle,
         actor_authority_path=authority,
     )
-    assert report["status"] == "FAIL_CLOSED"
+    assert report["status"] == "NO_GO"
     assert report["native_timestep_status"] == "INVALID_OR_COMPRESSED"
     assert "NO_GO_EXISTING_LOG_DENSITY" in report["gates"]
     assert "NO_GO_ORACLE_DISCOUNTED_VALUE" in report["gates"]
 
 
-def test_ranking_seal_precedes_oracle_join_and_exports_raw_na(tmp_path: Path):
-    seal = seal_ranking(
-        tmp_path / "raw.seal.json",
-        method_id="RAW_DELTA_TASK5",
-        context_id="ctx",
-        score_kind="compatibility",
-        scores={"a": 0.1, "b": 0.9, "c": 0.2},
-        diagnostics={"b": {"runtime_seconds": 0.25}},
-        provenance={"membership_digest": "f" * 64},
-    )
-    assert load_ranking_seal(seal.path).digest == seal.digest
-    metrics = join_oracle_and_score(
-        seal.path,
-        oracle_values={"a": 2.0, "b": 1.0, "c": 3.0},
-    )
-    assert metrics["hit_at_1"] == 0
-    assert metrics["regret_at_1"] == 2.0
-    assert metrics["value_mae"] is None
-    assert metrics["value_rmse"] is None
-    paths = export_metrics(
-        [metrics],
-        json_path=tmp_path / "metrics.json",
-        csv_path=tmp_path / "metrics.csv",
-    )
-    assert Path(paths["json"]).is_file()
-    assert Path(paths["csv"]).is_file()
-    assert paths["json_sha256"] == sha256(Path(paths["json"]).read_bytes()).hexdigest()
-    csv_text = Path(paths["csv"]).read_text(encoding="utf-8")
-    assert "value_mae,value_rmse" in csv_text
+def _raw_request_binding() -> dict:
+    return {
+        "request_schema": RAW_REQUEST_SCHEMA,
+        "method_id": "RAW_ADAPTER_FIXTURE",
+        "task_id": "TASK",
+        "context_id": "ctx",
+        "candidate_ids": [f"candidate-{index}" for index in range(5)],
+        "query": {
+            "schema": RAW_QUERY_SCHEMA,
+            "artifact_sha256": "d" * 64,
+            "fields": [
+                "observation",
+                "action",
+                "next_observation",
+                "native_timestep",
+                "episode_offsets",
+            ],
+            "forbidden_fields": ["reward", "oracle", "candidate_action"],
+        },
+        "membership_digest": "e" * 64,
+    }
 
 
-def test_value_metrics_are_reported_for_ope_scores(tmp_path: Path):
-    seal = seal_ranking(
-        tmp_path / "fqe.seal.json",
-        method_id="FH_FQE_G099_H1000",
-        context_id="ctx",
-        score_kind="value",
-        scores={"a": 2.5, "b": 1.0, "c": 0.0},
-        diagnostics={"a": {"ess": 12.0, "runtime_seconds": 0.1}},
-        provenance={"dataset_digest": "a" * 64},
+def _write_raw_response(path: Path, binding: dict, *, schema: str = RAW_RESPONSE_SCHEMA) -> None:
+    request_digest = sha256(
+        json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    path.write_text(
+        json.dumps(
+            {
+                "schema": schema,
+                "request_binding": binding,
+                "request_sha256": request_digest,
+                "scores": {
+                    f"candidate-{index}": float(index) for index in range(5)
+                },
+                "synthetic_fixture_only": True,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
     )
-    metrics = join_oracle_and_score(
-        seal.path,
-        oracle_values={"a": 3.0, "b": 1.0, "c": 1.0},
-    )
-    assert metrics["hit_at_1"] == 1
-    assert metrics["value_mae"] == pytest.approx(0.5)
-    assert metrics["value_rmse"] == pytest.approx(np.sqrt(1.25 / 3.0))
-    assert metrics["ess_min"] == 12.0
 
 
-def test_pre_join_seal_rejects_nested_oracle_provenance(tmp_path: Path):
-    with pytest.raises(ValueError, match="oracle-bearing"):
-        seal_ranking(
-            tmp_path / "leaky.json",
-            method_id="FH_FQE_G099_H1000",
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "request_schema",
+        "method_id",
+        "task_id",
+        "context_id",
+        "candidate_ids",
+        "query_schema",
+        "query_artifact_digest",
+        "membership_digest",
+    ],
+)
+def test_sealed_raw_response_binds_every_request_identity(tmp_path: Path, mutation: str):
+    binding = _raw_request_binding()
+    if mutation == "candidate_ids":
+        binding["candidate_ids"] = ["intruder", *binding["candidate_ids"][1:]]
+    elif mutation == "query_schema":
+        binding["query"]["schema"] = "wrong-query-schema"
+    elif mutation == "query_artifact_digest":
+        binding["query"]["artifact_sha256"] = "0" * 64
+    else:
+        binding[mutation] = "wrong"
+    artifact = tmp_path / f"{mutation}.json"
+    _write_raw_response(artifact, binding)
+    adapter = RawDeltaTask5Adapter(
+        SealedRawOperator(artifact, sha256_file(artifact)),
+        method_id="RAW_ADAPTER_FIXTURE",
+    )
+    with pytest.raises(GateClosed, match="request binding mismatch"):
+        adapter.score(
             context_id="ctx",
-            score_kind="value",
-            scores={"a": 1.0},
-            provenance={"nested": {"oracle_path": "/private/value.json"}},
+            task_id="TASK",
+            candidate_tasks={f"candidate-{index}": "TASK" for index in range(5)},
+            query_artifact_digest="d" * 64,
+            membership_digest="e" * 64,
         )
+
+
+def test_sealed_raw_response_schema_and_digest_fail_closed(tmp_path: Path):
+    binding = _raw_request_binding()
+    artifact = tmp_path / "response.json"
+    _write_raw_response(artifact, binding, schema="raw-response-self-asserted.v0")
+    adapter = RawDeltaTask5Adapter(
+        SealedRawOperator(artifact, sha256_file(artifact)),
+        method_id="RAW_ADAPTER_FIXTURE",
+    )
+    with pytest.raises(GateClosed, match="response schema mismatch"):
+        adapter.score(
+            context_id="ctx",
+            task_id="TASK",
+            candidate_tasks={f"candidate-{index}": "TASK" for index in range(5)},
+            query_artifact_digest="d" * 64,
+            membership_digest="e" * 64,
+        )
+
+    _write_raw_response(artifact := tmp_path / "production-response.json", binding)
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    payload["synthetic_fixture_only"] = False
+    artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    non_fixture = RawDeltaTask5Adapter(
+        SealedRawOperator(artifact, sha256_file(artifact)),
+        method_id="RAW_ADAPTER_FIXTURE",
+    )
+    with pytest.raises(GateClosed, match="only an explicitly synthetic"):
+        non_fixture.score(
+            context_id="ctx",
+            task_id="TASK",
+            candidate_tasks={f"candidate-{index}": "TASK" for index in range(5)},
+            query_artifact_digest="d" * 64,
+            membership_digest="e" * 64,
+        )
+
+
+def test_census_missing_dataset_is_stable_no_go(tmp_path: Path):
+    report = census_real_assets(dataset_path=tmp_path / "absent.npz")
+    assert report["status"] == "NO_GO"
+    assert report["native_timestep_status"] == "NO_GO_MISSING_DATASET"
+    assert report["exact_behavior_density"] is False
+    assert report["oracle_per_step_rewards"] is False
+    assert report["actor_authority_valid"] is False
+    assert {
+        "NO_GO_ASSET_ABI",
+        "NO_GO_EXISTING_LOG_DENSITY",
+        "NO_GO_ORACLE_DISCOUNTED_VALUE",
+        "NO_GO_ACTOR_AUTHORITY",
+    }.issubset(report["gates"])
+
+
+def test_census_malformed_scalar_dataset_is_stable_no_go(tmp_path: Path):
+    dataset = tmp_path / "scalar.npz"
+    np.savez(
+        dataset,
+        observation=np.asarray(1.0),
+        action=np.zeros((1, 1)),
+        reward=np.zeros(1),
+        next_observation=np.zeros((1, 1)),
+        terminated=np.zeros(1, dtype=bool),
+        truncated=np.zeros(1, dtype=bool),
+        dataset_cut=np.zeros(1, dtype=bool),
+        episode_id=np.zeros(1, dtype=np.int64),
+        episode_offsets=np.asarray([0, 1]),
+    )
+    report = census_real_assets(
+        dataset_path=dataset,
+        expected_dataset_digest=sha256_file(dataset),
+    )
+    assert report["status"] == "NO_GO"
+    assert report["dataset_structure_status"] in {
+        "NO_GO_INVALID_STRUCTURE",
+        "NO_GO_UNREADABLE_DATASET",
+    }
+    assert "NO_GO_ASSET_ABI" in report["gates"]
+
+
+def test_census_accepts_valid_native_subsample_but_not_truthy_capability_claims(
+    tmp_path: Path,
+):
+    dataset = tmp_path / "native-subsample.npz"
+    native = np.asarray([2, 5, 1, 7], dtype=np.int64)
+    np.savez(
+        dataset,
+        observation=np.zeros((4, 2)),
+        action=np.zeros((4, 1)),
+        reward=np.zeros(4),
+        next_observation=np.zeros((4, 2)),
+        terminated=np.zeros(4, dtype=bool),
+        truncated=np.zeros(4, dtype=bool),
+        dataset_cut=np.zeros(4, dtype=bool),
+        episode_id=np.asarray([0, 0, 1, 1]),
+        episode_offsets=np.asarray([0, 2, 4]),
+        native_timestep=native,
+        timestep_provenance=np.asarray("native_indices"),
+    )
+    density = tmp_path / "density.json"
+    density.write_text(
+        json.dumps(
+            {
+                "exact_arbitrary_action_log_prob": True,
+                "distribution": "claimed-gaussian",
+                "action_transform": "claimed-identity",
+            }
+        ),
+        encoding="utf-8",
+    )
+    oracle = tmp_path / "oracle.json"
+    oracle.write_text(json.dumps({"per_step_rewards": [[1.0, 2.0]]}), encoding="utf-8")
+    authority = tmp_path / "actor.json"
+    _authority(semantics="deterministic").to_json(authority)
+
+    report = census_real_assets(
+        dataset_path=dataset,
+        oracle_path=oracle,
+        density_manifest_path=density,
+        actor_authority_path=authority,
+        horizon=10,
+        expected_dataset_digest=sha256_file(dataset),
+        expected_oracle_digest=sha256_file(oracle),
+        expected_density_manifest_digest=sha256_file(density),
+        expected_actor_authority_digest=sha256_file(authority),
+    )
+    assert report["native_timestep_status"] == "EXPLICIT_NATIVE_INDICES"
+    assert report["dataset_authority_status"] == "DIGEST_VERIFIED"
+    assert report["exact_behavior_density_declared"] is True
+    assert report["exact_behavior_density"] is False
+    assert report["oracle_per_step_rewards_declared"] is True
+    assert report["oracle_per_step_rewards"] is False
+    assert report["actor_authority_declared_valid"] is True
+    assert report["actor_authority_valid"] is False
+    assert report["status"] == "NO_GO"
+
+
+def test_census_accepts_complete_early_terminated_native_episodes(tmp_path: Path):
+    dataset = tmp_path / "early-terminated.npz"
+    np.savez(
+        dataset,
+        observation=np.zeros((5, 2)),
+        action=np.zeros((5, 1)),
+        reward=np.zeros(5),
+        next_observation=np.zeros((5, 2)),
+        terminated=np.asarray([False, True, False, False, True]),
+        truncated=np.zeros(5, dtype=bool),
+        dataset_cut=np.zeros(5, dtype=bool),
+        episode_id=np.asarray([0, 0, 1, 1, 1]),
+        episode_offsets=np.asarray([0, 2, 5]),
+        native_timestep=np.asarray([0, 1, 0, 1, 2]),
+        timestep_provenance=np.asarray("episode_offsets"),
+    )
+    report = census_real_assets(
+        dataset_path=dataset,
+        horizon=5,
+        expected_dataset_digest=sha256_file(dataset),
+    )
+    assert report["native_timestep_status"] == "EXPLICIT_COMPLETE_EPISODES"
+    assert report["dataset_structure_status"] == "PASS"
+    assert report["dataset_authority_status"] == "DIGEST_VERIFIED"
+    assert "NO_GO_ASSET_ABI" not in report["gates"]
+    # Production still fails closed on the three unavailable capabilities.
+    assert report["status"] == "NO_GO"
+
+
+def test_census_derives_native_time_for_complete_early_terminated_episodes(
+    tmp_path: Path,
+):
+    dataset = tmp_path / "early-derived.npz"
+    np.savez(
+        dataset,
+        observation=np.zeros((5, 2)),
+        action=np.zeros((5, 1)),
+        reward=np.zeros(5),
+        next_observation=np.zeros((5, 2)),
+        terminated=np.asarray([False, True, False, False, True]),
+        truncated=np.zeros(5, dtype=bool),
+        dataset_cut=np.zeros(5, dtype=bool),
+        episode_id=np.asarray([0, 0, 1, 1, 1]),
+        episode_offsets=np.asarray([0, 2, 5]),
+    )
+    report = census_real_assets(
+        dataset_path=dataset,
+        horizon=5,
+        expected_dataset_digest=sha256_file(dataset),
+    )
+    assert (
+        report["native_timestep_status"]
+        == "DERIVABLE_FROM_COMPLETE_EPISODE_OFFSETS"
+    )
+    assert report["dataset_structure_status"] == "PASS"
+    assert "NO_GO_ASSET_ABI" not in report["gates"]
+
+
+def test_census_accepts_short_dataset_cut_as_explicit_membership_boundary(
+    tmp_path: Path,
+):
+    dataset = tmp_path / "short-cut.npz"
+    np.savez(
+        dataset,
+        observation=np.zeros((3, 2)),
+        action=np.zeros((3, 1)),
+        reward=np.zeros(3),
+        next_observation=np.zeros((3, 2)),
+        terminated=np.zeros(3, dtype=bool),
+        truncated=np.asarray([False, False, True]),
+        dataset_cut=np.asarray([False, False, True]),
+        episode_id=np.zeros(3, dtype=np.int64),
+        episode_offsets=np.asarray([0, 3]),
+        native_timestep=np.arange(3),
+        timestep_provenance=np.asarray("episode_offsets"),
+        truncation_reason=np.asarray(["none", "none", "dataset_cut"]),
+    )
+    report = census_real_assets(
+        dataset_path=dataset,
+        horizon=5,
+        expected_dataset_digest=sha256_file(dataset),
+    )
+    assert report["native_timestep_status"] == "EXPLICIT_COMPLETE_EPISODES"
+    assert report["dataset_structure_status"] == "PASS"
+    assert "NO_GO_ASSET_ABI" not in report["gates"]
+
+
+def test_census_never_upgrades_sample_ordinals_to_native_time(tmp_path: Path):
+    rows = 64
+    dataset = tmp_path / "sample-ordinals.npz"
+    np.savez(
+        dataset,
+        observation=np.zeros((rows, 2)),
+        action=np.zeros((rows, 1)),
+        reward=np.zeros(rows),
+        next_observation=np.zeros((rows, 2)),
+        terminated=np.zeros(rows, dtype=bool),
+        truncated=np.concatenate([np.zeros(rows - 1, dtype=bool), [True]]),
+        dataset_cut=np.concatenate([np.zeros(rows - 1, dtype=bool), [True]]),
+        episode_id=np.zeros(rows, dtype=np.int64),
+        episode_offsets=np.asarray([0, rows]),
+        native_timestep=np.arange(rows),
+        timestep_provenance=np.asarray("sample_ordinal"),
+        truncation_reason=np.asarray([*["none"] * (rows - 1), "dataset_cut"]),
+    )
+    report = census_real_assets(
+        dataset_path=dataset,
+        horizon=1000,
+        expected_dataset_digest=sha256_file(dataset),
+    )
+    assert report["native_timestep_status"] == "INVALID_TIMESTEP_PROVENANCE"
+    assert "NO_GO_ASSET_ABI" in report["gates"]
+
+
+@pytest.mark.parametrize("corruption", ["nan", "row_count"])
+def test_digest_verified_dataset_still_fails_invalid_structure(
+    tmp_path: Path,
+    corruption: str,
+):
+    dataset = tmp_path / f"invalid-{corruption}.npz"
+    observation = np.zeros((3, 2))
+    next_observation = np.zeros((3, 2))
+    if corruption == "nan":
+        observation[1, 0] = np.nan
+    else:
+        next_observation = next_observation[:2]
+    np.savez(
+        dataset,
+        observation=observation,
+        action=np.zeros((3, 1)),
+        reward=np.zeros(3),
+        next_observation=next_observation,
+        terminated=np.zeros(3, dtype=bool),
+        truncated=np.zeros(3, dtype=bool),
+        dataset_cut=np.zeros(3, dtype=bool),
+        episode_id=np.zeros(3, dtype=np.int64),
+        episode_offsets=np.asarray([0, 3]),
+        native_timestep=np.arange(3),
+    )
+    report = census_real_assets(
+        dataset_path=dataset,
+        horizon=3,
+        expected_dataset_digest=sha256_file(dataset),
+    )
+    assert report["dataset_authority_status"] == "DIGEST_VERIFIED"
+    assert report["native_timestep_status"] == "EXPLICIT_FULL_EPISODES"
+    assert report["dataset_structure_status"] == "NO_GO_INVALID_STRUCTURE"
+    assert "NO_GO_ASSET_ABI" in report["gates"]
+    assert report["status"] == "NO_GO"
+
+
+def test_census_strict_contract_rejects_terminal_before_group_end(tmp_path: Path):
+    dataset = tmp_path / "terminal-mid-group.npz"
+    np.savez(
+        dataset,
+        observation=np.zeros((3, 2)),
+        action=np.zeros((3, 1)),
+        reward=np.zeros(3),
+        next_observation=np.zeros((3, 2)),
+        terminated=np.asarray([True, False, False]),
+        truncated=np.zeros(3, dtype=bool),
+        dataset_cut=np.zeros(3, dtype=bool),
+        episode_id=np.zeros(3, dtype=np.int64),
+        episode_offsets=np.asarray([0, 3]),
+        native_timestep=np.arange(3),
+    )
+    report = census_real_assets(
+        dataset_path=dataset,
+        horizon=3,
+        expected_dataset_digest=sha256_file(dataset),
+    )
+    assert report["dataset_structure_status"] == "NO_GO_INVALID_DATA_CONTRACT"
+    assert report["native_timestep_status"] == "INVALID_DATA_CONTRACT"
+    assert "NO_GO_ASSET_ABI" in report["gates"]

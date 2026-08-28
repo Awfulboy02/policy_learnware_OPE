@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 
 from policy_learnware_ope.core import PolicySemantics, TransitionBatch
 from policy_learnware_ope.mbope import (
-    AR_MBOPE_ID,
     DOPE_STYLE_MB_FF_ID,
-    ETM_MBOPE_ID,
     ARMBOPEEstimator,
     DOPEStyleMBFFEstimator,
     ETMMBOPEEstimator,
@@ -52,6 +48,31 @@ class KeyedLinearActor(LinearActor):
         key_array = np.asarray(keys, dtype=np.uint64)
         jitter = ((key_array % 1009).astype(float) / 1008.0 - 0.5) * 0.02
         return base + jitter[:, None]
+
+
+class ActionsOnlyActor:
+    """An unbound provider shape that must not bypass the bound actor ABI."""
+
+    policy_id = "toy-actions-only"
+    semantics = PolicySemantics.DETERMINISTIC
+
+    def __init__(self) -> None:
+        self.native_times: list[np.ndarray] = []
+
+    def actions(
+        self,
+        candidate_id: str,
+        observations: np.ndarray,
+        *,
+        native_timestep: np.ndarray,
+        action_keys: np.ndarray,
+        require_deterministic: bool = False,
+    ) -> np.ndarray:
+        assert candidate_id == self.policy_id
+        assert not require_deterministic
+        assert np.asarray(action_keys).dtype.kind in "iu"
+        self.native_times.append(np.asarray(native_timestep).copy())
+        return -0.25 * observations[:, :1] + 0.02 * native_timestep[:, None]
 
 
 def _linear_batch(*, episodes: int = 72, horizon: int = 5, seed: int = 7) -> TransitionBatch:
@@ -153,8 +174,16 @@ def test_each_model_based_line_really_fits_and_estimates_known_finite_horizon(es
     assert estimate.status.value == "PASS"
     assert np.isfinite(estimate.value)
     assert abs(estimate.value - expected) < 1.25
+    assert estimate.method_id == estimator.method_id
+    assert estimate.method_id.endswith("_G099_H5")
+    assert "H1000" not in estimate.method_id
     assert estimate.provenance["value_convention"] == "J_gamma=0.99_H=5_raw"
-    assert estimate.provenance["production_method_convention"] == "J_gamma=0.99_H=1000_raw"
+    assert estimate.provenance["upstream_parity_claim"] == "NONE"
+    assert estimate.provenance["physical_membership_sha256"]
+    assert (
+        estimate.provenance["physical_membership_sha256"]
+        == estimate.diagnostics["physical_membership_sha256"]
+    )
     assert estimate.diagnostics["native_timestep_used"] is True
     assert estimate.diagnostics["dataset_cut_rows_treated_as_nonterminal"] == 3
     assert estimate.diagnostics["truncation_rows_not_relabeled_terminal"] == 75
@@ -175,27 +204,85 @@ def test_method_identity_and_faithfulness_diagnostics_are_distinct() -> None:
     for position, estimator in enumerate(_estimators()):
         actor = LinearActor()
         estimator.fit(batch, actor, fit_keys=np.asarray([900 + position], dtype=np.uint64))
-        results[estimator.method_id] = estimator.estimate(
+        results[type(estimator)] = estimator.estimate(
             initial, keys=np.asarray([77, 88], dtype=np.uint64)
         )
 
-    feed_forward = results[DOPE_STYLE_MB_FF_ID].diagnostics
+    feed_forward_result = results[DOPEStyleMBFFEstimator]
+    feed_forward = feed_forward_result.diagnostics
+    assert feed_forward_result.provenance["scientific_role"] == "PROJECT_DEFINED_REFERENCE"
     assert feed_forward["method_identity"]["dope_is_benchmark_inspiration_not_algorithm"] is True
+    assert feed_forward["method_identity"]["upstream_parity_claimed"] is False
     assert feed_forward["feed_forward_head"] == "random_tanh_features_plus_ridge"
 
-    autoregressive = results[AR_MBOPE_ID].diagnostics
+    autoregressive_result = results[ARMBOPEEstimator]
+    autoregressive = autoregressive_result.diagnostics
+    assert (
+        autoregressive_result.provenance["scientific_role"]
+        == "PROJECT_METHOD_LEVEL_ADAPTATION_PROXY"
+    )
     assert autoregressive["training"] == "teacher_forcing"
     assert autoregressive["generation"] == "fixed_order_sequential"
     assert autoregressive["factorization_order"] == ["delta_state[0]", "reward"]
     assert np.isfinite(autoregressive["teacher_forced_mse"])
     assert np.isfinite(autoregressive["free_running_one_step_mse"])
 
-    energy = results[ETM_MBOPE_ID].diagnostics
+    energy_result = results[ETMMBOPEEstimator]
+    energy = energy_result.diagnostics
+    assert (
+        energy_result.provenance["scientific_role"]
+        == "PROJECT_CONTRASTIVE_ENERGY_ADAPTATION_PROXY"
+    )
     assert energy["contrastive_objective"] == "InfoNCE_with_replay_negatives"
     assert energy["inference_sampler"] == "Langevin"
     assert energy["contrastive_steps"] == 45
     assert energy["langevin_steps"] == 10
     assert np.isfinite(energy["positive_negative_energy_gap"])
+
+
+def test_model_based_configuration_and_failed_refit_fail_closed() -> None:
+    with pytest.raises(ValueError, match="ridge"):
+        DOPEStyleMBFFEstimator(ridge=-1e-3)
+    with pytest.raises(ValueError, match="learning_rate"):
+        ETMMBOPEEstimator(learning_rate=0.0)
+    with pytest.raises(ValueError, match="langevin_step_size"):
+        ETMMBOPEEstimator(langevin_step_size=0.0)
+
+    estimator = DOPEStyleMBFFEstimator(
+        horizon=5,
+        rollouts_per_initial=2,
+        ensemble_members=2,
+        hidden_dim=12,
+    ).fit(
+        _linear_batch(episodes=24),
+        LinearActor(),
+        fit_keys=np.asarray([7], dtype=np.uint64),
+    )
+    episodes = 24
+    length = 3
+    rows = episodes * length
+    terminal = np.tile(np.asarray([False, False, True]), episodes)
+    terminal_batch = TransitionBatch(
+        observation=np.zeros((rows, 1)),
+        action=np.zeros((rows, 1)),
+        reward=np.ones(rows),
+        next_observation=np.zeros((rows, 1)),
+        terminated=terminal,
+        truncated=np.zeros(rows, dtype=bool),
+        dataset_cut=np.zeros(rows, dtype=bool),
+        native_timestep=np.tile(np.arange(length), episodes),
+        episode_id=np.repeat(np.arange(episodes), length),
+        episode_offsets=np.arange(0, rows + 1, length),
+        timestep_provenance="episode_offsets",
+    )
+    with pytest.raises(ValueError, match="termination|episode offset"):
+        estimator.fit(
+            terminal_batch,
+            LinearActor(),
+            fit_keys=np.asarray([8], dtype=np.uint64),
+        )
+    with pytest.raises(RuntimeError, match="fit must be called"):
+        estimator.estimate(np.zeros((1, 1)), keys=np.asarray([1], dtype=np.uint64))
 
 
 def test_keyed_stochastic_actor_is_reproducible_and_bad_timestep_fails_closed() -> None:
@@ -213,27 +300,18 @@ def test_keyed_stochastic_actor_is_reproducible_and_bad_timestep_fails_closed() 
     keys = np.asarray([55, 66], dtype=np.uint64)
     first = estimator.estimate(initial, keys=keys)
     second = estimator.estimate(initial, keys=keys)
+    assert estimator.method_id == "DOPE_STYLE_MB_FF_G099_H5"
     assert first.value == second.value
     assert first.support["actor_semantics"] == "stochastic_keyed"
     assert first.diagnostics["rollout_key_digest"] == second.diagnostics["rollout_key_digest"]
+    assert (
+        first.provenance["physical_membership_sha256"]
+        == second.provenance["physical_membership_sha256"]
+    )
 
-    fields = {
-        name: getattr(batch, name)
-        for name in (
-            "observation",
-            "action",
-            "reward",
-            "next_observation",
-            "terminated",
-            "truncated",
-            "dataset_cut",
-            "native_timestep",
-        )
-    }
-    compressed = SimpleNamespace(**fields, timestep_provenance="subsample_ordinal_0_63")
-    with pytest.raises(ValueError, match="compressed/subsample ordinal"):
+    with pytest.raises(ValueError, match="core.TransitionBatch"):
         DOPEStyleMBFFEstimator(horizon=5).fit(
-            compressed, actor, fit_keys=np.asarray([1], dtype=np.uint64)
+            object(), actor, fit_keys=np.asarray([1], dtype=np.uint64)
         )
 
 
@@ -266,8 +344,53 @@ def test_native_environment_termination_stops_learned_rollout() -> None:
         learn_termination=True,
     ).fit(batch, actor, fit_keys=np.asarray([919], dtype=np.uint64))
     estimate = estimator.estimate(np.zeros((3, 1)), keys=np.asarray([4, 5, 6]))
-    assert estimate.method_id == f"{DOPE_STYLE_MB_FF_ID}_TLEARNED"
+    assert estimate.method_id == "DOPE_STYLE_MB_FF_G099_H5_TLEARNED"
     assert estimate.diagnostics["termination_contract"] == "learned"
     assert estimate.diagnostics["learned_environment_termination_count"] == 24
     assert estimate.diagnostics["mean_rollout_length"] == pytest.approx(3.0)
     assert estimate.value == pytest.approx(1.0 + 0.99 + 0.99**2, abs=0.08)
+
+
+def test_method_ids_keys_and_bound_actor_abi_are_strict() -> None:
+    assert DOPEStyleMBFFEstimator().method_id == DOPE_STYLE_MB_FF_ID
+    assert ARMBOPEEstimator(gamma=1.0, horizon=7).method_id == "AR_MBOPE_G1000_H7"
+    assert ETMMBOPEEstimator(gamma=0.995, horizon=9).method_id == "ETM_MBOPE_G0995_H9"
+
+    batch = _linear_batch(episodes=32)
+    actor = LinearActor()
+    estimator = DOPEStyleMBFFEstimator(
+        horizon=5, rollouts_per_initial=2, ensemble_members=2, hidden_dim=12
+    )
+    for invalid in (np.asarray([1.5]), np.asarray([-1]), np.asarray([True])):
+        with pytest.raises(ValueError, match="integers|non-negative"):
+            estimator.fit(batch, actor, fit_keys=invalid)
+
+    estimator.fit(batch, actor, fit_keys=np.asarray([7], dtype=np.uint64))
+    for invalid in (np.asarray([2.5]), np.asarray([-2]), np.asarray([False])):
+        with pytest.raises(ValueError, match="integers|non-negative"):
+            estimator.estimate(np.asarray([[0.0]]), keys=invalid)
+
+    estimate = estimator.estimate(np.asarray([[0.0]]), keys=np.asarray([2]))
+    assert estimate.status.value == "PASS"
+    assert actor.calls
+
+    with pytest.raises(TypeError, match="sample_actions"):
+        estimator.estimate(
+            np.asarray([[0.0]]),
+            keys=np.asarray([2]),
+            candidate=ActionsOnlyActor(),
+        )
+
+    class MissingSemanticsActor:
+        policy_id = "missing-semantics"
+
+        def sample_actions(self, observations, native_timestep, *, keys):
+            del native_timestep, keys
+            return np.zeros((len(observations), 1))
+
+    with pytest.raises(ValueError, match="declare deterministic"):
+        estimator.estimate(
+            np.asarray([[0.0]]),
+            keys=np.asarray([2]),
+            candidate=MissingSemanticsActor(),
+        )
