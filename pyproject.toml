@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "policy-learnware-ope"
-version = "0.4.0b0"
+version = "0.4.1b0"
 description = "Finite-horizon OPE companion for frozen Policy Learnware assets"
 readme = "README.md"
 requires-python = ">=3.11"

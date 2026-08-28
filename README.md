@@ -1,4 +1,4 @@
-# Policy Learnware OPE v0.4b
+# Policy Learnware OPE v0.41b
 
 Small companion repository for method-level, finite-horizon policy-selection
 experiments. The v03 repository, policy bundles, logs, manifests, and oracle
@@ -7,10 +7,13 @@ assets remain read-only external inputs.
 The executable synthetic MVP contains five fitted estimators:
 
 - `FH_FQE`: compact NumPy finite-horizon ridge FQE reference.
-- `FH_KMIFQE`: project adaptation used to exercise the exact-density and
-  support path; it is not an official KMIFQE reproduction.
-- `ETM_MBOPE`: project contrastive-energy adaptation/proxy, not the official
-  ETM architecture.
+- `FH_KMIFQE`: B20 protocol adaptation with a candidate-specific nonlinear
+  critic/target critic, local action-Hessian metrics, B20 bias/variance
+  bandwidth updates, replacement importance resampling, and in-sample TD on
+  logged adjacent actions.
+- `ETM_MBOPE`: B22 protocol adaptation with model-generated training-time
+  Langevin negatives and an analytic gradient-penalty VJP into the trainable
+  RFF energy head.
 - `DOPE_STYLE_MB_FF`: project-defined feed-forward model-based reference. DOPE
   is inspiration for the benchmark design, not the name of an upstream
   algorithm implemented here.
@@ -55,3 +58,15 @@ only after the seal and are exported in `runtime.json` and post-join metrics.
 `TOY_MVP_PASS` means the method executed a real fit/estimate path on the
 synthetic fixture. It does not mean paper-level or official-code parity, and it
 does not claim that the production real-asset gates have passed.
+
+The KMIFQE critic is a compact fixed-tanh-feature NumPy adaptation rather than
+the official fully trained PyTorch network. The ETM energy is a compact RFF
+adaptation rather than the official four-layer MLP. Both export their actual
+configuration and remaining drift, and neither claims published benchmark
+parity.
+
+Hashes are exact for discrete protocol identity, assets, membership, seeds,
+configuration, and sealed ranking artifacts. Floating results are checked with
+declared dtype-aware tolerances plus finiteness, mechanism invariants, and
+ranking stability; a legitimate backend-rounding difference is not treated as
+an asset or protocol mismatch.

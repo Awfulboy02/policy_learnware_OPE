@@ -29,6 +29,7 @@ from .core import (
     policy_semantics,
     validate_action_keys,
 )
+from .kmifqe import B20KMIFQETrainer, seed_from_keys
 
 
 FH_FQE_METHOD_ID = "FH_FQE_G099_H1000"
@@ -335,7 +336,16 @@ class FiniteHorizonFQE:
             )
         action_scale = np.std(batch.action, axis=0)
         action_scale[action_scale < 1e-6] = 1.0
-        distance = np.linalg.norm((current_action - batch.action) / action_scale, axis=1)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            standardized_delta = (current_action - batch.action) / action_scale
+            distance = np.linalg.norm(standardized_delta, axis=1)
+        if not np.all(np.isfinite(standardized_delta)) or not np.all(
+            np.isfinite(distance)
+        ):
+            raise DataValidationError(
+                EstimateStatus.FAILED.value,
+                "action-support distance became non-finite",
+            )
         self._support = {
             "kind": "pointwise_logged_state_action_distance",
             "mean_action_distance": float(np.mean(distance)),
@@ -420,13 +430,7 @@ class FiniteHorizonFQE:
 
 
 class FiniteHorizonKMIFQE(FiniteHorizonFQE):
-    """Kernel-smoothed, importance-weighted finite-horizon FQE adaptation.
-
-    For active Bellman rows, the deterministic target action is matched to the
-    logged next behavior action using a Gaussian kernel and inverse exact
-    behavior density.  The density is also queried at the arbitrary target
-    action, both to establish the required API and to gate target support.
-    """
+    """Finite-horizon B20 protocol adaptation with in-sample TD."""
 
     method_id = FH_KMIFQE_METHOD_ID
     method_family = "FH_KMIFQE"
@@ -442,6 +446,18 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
         kernel_bandwidth: float | None = None,
         min_log_density: float = -50.0,
         min_ess_fraction: float = 0.01,
+        critic_features: int = 32,
+        eigenvalue_floor: float = 1e-6,
+        metric_regularization: float = 0.1,
+        bandwidth_floor: float = 1e-3,
+        bandwidth_ceiling: float = 10.0,
+        ratio_clip_min: float = 1e-3,
+        ratio_clip_max: float = 2.0,
+        target_density_floor: float = 1e-12,
+        resample_size: int | None = None,
+        target_update_interval: int = 1,
+        critic_step_size: float = 0.1,
+        probability_tolerance: float | None = None,
     ) -> None:
         super().__init__(
             gamma=gamma,
@@ -450,15 +466,44 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
             max_iterations=max_iterations,
             tolerance=tolerance,
         )
-        if kernel_bandwidth is not None and (kernel_bandwidth <= 0 or not np.isfinite(kernel_bandwidth)):
-            raise ValueError("kernel_bandwidth must be finite and positive")
+        if kernel_bandwidth is not None:
+            raise ValueError(
+                "fixed kernel_bandwidth is unavailable on the B20 protocol path; "
+                "bandwidth is estimated from TD-MSE bias and variance"
+            )
         if not np.isfinite(min_log_density):
             raise ValueError("min_log_density must be finite")
         if not 0.0 < float(min_ess_fraction) <= 1.0:
             raise ValueError("min_ess_fraction must lie in (0, 1]")
-        self.kernel_bandwidth = None if kernel_bandwidth is None else float(kernel_bandwidth)
         self.min_log_density = float(min_log_density)
         self.min_ess_fraction = float(min_ess_fraction)
+        # Validate the method-specific configuration once without retaining a
+        # half-fitted trainer.  Every candidate gets a fresh trainer in fit().
+        validated = B20KMIFQETrainer(
+            gamma=self.gamma,
+            horizon=self.horizon,
+            ridge=self.ridge,
+            max_iterations=self.max_iterations,
+            tolerance=self.tolerance,
+            hidden_features=critic_features,
+            eigenvalue_floor=eigenvalue_floor,
+            metric_regularization=metric_regularization,
+            bandwidth_floor=bandwidth_floor,
+            bandwidth_ceiling=bandwidth_ceiling,
+            ratio_clip_min=ratio_clip_min,
+            ratio_clip_max=ratio_clip_max,
+            target_density_floor=target_density_floor,
+            resample_size=resample_size,
+            target_update_interval=target_update_interval,
+            critic_step_size=critic_step_size,
+            probability_tolerance=probability_tolerance,
+        )
+        self._kmifqe_config = {
+            **validated.config,
+            "min_log_density": self.min_log_density,
+            "min_ess_fraction": self.min_ess_fraction,
+        }
+        self._trainer: B20KMIFQETrainer | None = None
 
     def fit(
         self,
@@ -484,18 +529,38 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
             except DataValidationError:
                 semantics = PolicySemantics.STOCHASTIC_KEYED
             self._base_provenance(batch, semantics)
+            self._provenance.pop("planned_neural_critic_port", None)
             self._provenance.update(
                 {
-                    "implementation": "numpy_kernel_importance_weighted_time_ridge_fqe",
-                    "method_identity": "KMIFQE_PROJECT_ADAPTATION",
+                    "implementation": "numpy_nonlinear_B20_kernel_metric_in_sample_fqe",
+                    "implementation_scope": "EXECUTABLE_METHOD_LEVEL_PROTOCOL_ADAPTATION",
+                    "method_identity": "B20_PROTOCOL_ADAPTATION",
+                    "scientific_role": "B20_PROTOCOL_ADAPTATION",
                     "official_parity": False,
-                    "faithfulness_scope": "synthetic finite-horizon project fixture",
+                    "paper_benchmark_parity": False,
+                    "official_code_commit": "070f121d29f05638221695690d5b0d1f0e2bf75b",
+                    "faithfulness_scope": (
+                        "B20 mechanisms on the project finite-horizon raw-value protocol"
+                    ),
                     "density_id": str(getattr(behavior_density, "density_id", "")),
                     "density_exact": getattr(behavior_density, "exact", False) is True,
-                    "kernel": "gaussian_on_standardized_next_action",
-                    "metric_learning_scope": "diagonal_logged_action_standardization",
-                    "full_B20_Hessian_metric_port": "PENDING_REAL_ASSET_PHASE",
+                    "kernel": "B20_local_Mahalanobis_Gaussian",
+                    "metric_learning_scope": (
+                        "candidate-specific target-Q action Hessian, eigen floor, det(A)=1"
+                    ),
+                    "bandwidth": "B20_Eq11_TD_MSE_bias_variance_estimator",
                     "importance_weight": "K(a_next_behavior,pi(s_next))/mu(a_next_behavior|s_next)",
+                    "resampling": "replacement_with_probability_w_over_sum_w",
+                    "td_bootstrap": "same_resampled_row_logged_adjacent_action",
+                    "bias_correction": "mean_clipped_importance_weight",
+                    "trainer_config": dict(self._kmifqe_config),
+                    "remaining_drift": [
+                        "fixed seeded tanh feature critic rather than official fully-trained 2x256 tanh network",
+                        "damped analytic output-layer fit rather than official Adam critic update",
+                        "seeded common-random replacement uniforms are remapped each iteration rather than drawing a fresh minibatch",
+                        "finite-H native-time masks and raw J_gamma,H rather than normalized continuing value",
+                        "no MuJoCo/D4RL paper benchmark parity claim",
+                    ],
                 }
             )
             if getattr(behavior_density, "exact", False) is not True:
@@ -517,16 +582,150 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
                 )
                 return self
             mask = batch.bootstrap_mask(self.horizon)
-            next_action = self._query_next_actions(batch, candidate, keys, mask)
-            weight = self._kernel_importance_weights(
-                batch,
-                next_action,
-                mask,
-                behavior_density,
-            )
-            if weight is None:
+            next_target_action = self._query_next_actions(batch, candidate, keys, mask)
+            self._measure_action_support(batch, candidate, keys)
+            active = mask.astype(bool)
+            if not np.any(active):
+                self._close_gate(
+                    EstimateStatus.NO_GO_BEHAVIOR_SUPPORT,
+                    "KMIFQE requires at least one bootstrap-active transition",
+                )
                 return self
-            self._fit_ridge(batch, next_action, mask, weight)
+            next_times = batch.native_timestep[active] + 1
+            logged_next_action = batch.next_behavior_action
+            assert logged_next_action is not None
+            row = np.arange(len(batch) - 1)
+            contiguous = (
+                active[:-1]
+                & (batch.episode_id[:-1] == batch.episode_id[1:])
+                & (batch.native_timestep[1:] == batch.native_timestep[:-1] + 1)
+            )
+            verified_rows = row[contiguous]
+            if len(verified_rows) and not np.array_equal(
+                logged_next_action[verified_rows], batch.action[verified_rows + 1]
+            ):
+                raise DataValidationError(
+                    EstimateStatus.INVALID_DATA.value,
+                    "next_behavior_action contradicts the contiguous logged successor action",
+                )
+            verified_count = int(len(verified_rows))
+            unverified_count = int(np.sum(active)) - verified_count
+            self._provenance["logged_adjacency_authority"] = (
+                "CONTIGUOUS_ROWS_VERIFIED"
+                if unverified_count == 0
+                else "PARTIAL_VERIFICATION_WITH_UNVERIFIED_EXPORTED_ADJACENCY"
+            )
+            log_behavior_active = behavior_log_prob(
+                behavior_density,
+                batch.next_observation[active],
+                logged_next_action[active],
+                next_times,
+            )
+            # This second query proves that density is valid at arbitrary target
+            # actions, not merely a stored log-probability replay column.
+            log_target_active = behavior_log_prob(
+                behavior_density,
+                batch.next_observation[active],
+                next_target_action[active],
+                next_times,
+            )
+            finite_behavior = np.isfinite(log_behavior_active)
+            finite_target = np.isfinite(log_target_active)
+            supported_target = finite_target & (
+                log_target_active >= self.min_log_density
+            )
+            density_support = {
+                "active_rows": int(np.sum(active)),
+                "verified_adjacent_rows": verified_count,
+                "unverified_exported_adjacent_rows": unverified_count,
+                "finite_logged_density_fraction": float(np.mean(finite_behavior)),
+                "target_support_fraction": float(np.mean(supported_target)),
+                "minimum_required_log_density": self.min_log_density,
+            }
+            if not np.all(finite_behavior) or not np.all(supported_target):
+                self._support.update(density_support)
+                self._close_gate(
+                    EstimateStatus.NO_GO_BEHAVIOR_SUPPORT,
+                    "logged adjacent actions or arbitrary target actions lie outside certified behavior support",
+                )
+                return self
+            log_behavior = np.zeros(len(batch), dtype=np.float64)
+            log_target = np.zeros(len(batch), dtype=np.float64)
+            log_behavior[active] = log_behavior_active
+            log_target[active] = log_target_active
+            seed, seed_digest = seed_from_keys(keys)
+            trainer = B20KMIFQETrainer(
+                gamma=self.gamma,
+                horizon=self.horizon,
+                ridge=self.ridge,
+                max_iterations=self.max_iterations,
+                tolerance=self.tolerance,
+                hidden_features=int(self._kmifqe_config["hidden_features"]),
+                eigenvalue_floor=float(self._kmifqe_config["eigenvalue_floor"]),
+                metric_regularization=float(self._kmifqe_config["metric_regularization"]),
+                bandwidth_floor=float(self._kmifqe_config["bandwidth_floor"]),
+                bandwidth_ceiling=float(self._kmifqe_config["bandwidth_ceiling"]),
+                ratio_clip_min=float(self._kmifqe_config["ratio_clip"][0]),
+                ratio_clip_max=float(self._kmifqe_config["ratio_clip"][1]),
+                target_density_floor=float(self._kmifqe_config["target_density_floor"]),
+                resample_size=self._kmifqe_config["resample_size"],
+                target_update_interval=int(self._kmifqe_config["target_update_interval"]),
+                critic_step_size=float(self._kmifqe_config["critic_step_size"]),
+                probability_tolerance=float(
+                    self._kmifqe_config["probability_tolerance"]
+                ),
+            ).fit(
+                observation=batch.observation,
+                action=batch.action,
+                reward=batch.reward,
+                next_observation=batch.next_observation,
+                native_timestep=batch.native_timestep,
+                mask=mask,
+                target_next_action=next_target_action,
+                logged_next_action=logged_next_action,
+                log_behavior_density=log_behavior,
+                log_target_density=log_target,
+                seed=seed,
+                seed_digest=seed_digest,
+                min_ess_fraction=self.min_ess_fraction,
+            )
+            self._trainer = trainer
+            action_distance_support = dict(self._support)
+            self._support = {
+                **action_distance_support,
+                **density_support,
+                **trainer.support,
+                "target_log_density_min": float(np.min(log_target_active)),
+                "target_log_density_mean": float(np.mean(log_target_active)),
+                "behavior_log_density_min": float(np.min(log_behavior_active)),
+            }
+            self._diagnostics.update(trainer.diagnostics)
+            self._cost.update(trainer.cost)
+            if not trainer.support_ok:
+                self._close_gate(
+                    EstimateStatus.NO_GO_BEHAVIOR_SUPPORT,
+                    (
+                        f"importance-weight ESS fraction {trainer.support.get('ess_fraction', 0.0):.6g} "
+                        f"is below {self.min_ess_fraction:.6g}"
+                    ),
+                )
+                return self
+            if not trainer.converged:
+                self._close_gate(
+                    EstimateStatus.NO_GO_FIT_CONVERGENCE,
+                    f"B20 KMIFQE trainer did not converge within {self.max_iterations} iterations",
+                )
+                return self
+            if trainer.feature_map is None or trainer.coefficient is None:
+                raise DataValidationError(
+                    EstimateStatus.FAILED.value,
+                    "B20 KMIFQE trainer published incomplete critic state",
+                )
+            self._features = trainer.feature_map
+            self._coefficient = trainer.coefficient.copy()
+            self._fitted = True
+        except FloatingPointError as exc:
+            self._close_gate(EstimateStatus.FAILED, str(exc))
         except DataValidationError as exc:
             try:
                 status = EstimateStatus(exc.status)
@@ -537,100 +736,6 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
             self._cost["fit_seconds"] = float(perf_counter() - start)
             self._cost["fit_transitions"] = int(len(batch)) if isinstance(batch, TransitionBatch) else 0
         return self
-
-    def _kernel_importance_weights(
-        self,
-        batch: TransitionBatch,
-        next_action: np.ndarray,
-        mask: np.ndarray,
-        density: BehaviorDensityProvider,
-    ) -> np.ndarray | None:
-        active = mask.astype(bool)
-        weight = np.ones(len(batch), dtype=np.float64)
-        if not np.any(active):
-            self._support = {
-                "ess": float(len(batch)),
-                "ess_fraction": 1.0,
-                "active_rows": 0,
-            }
-            return weight
-        next_times = batch.native_timestep[active] + 1
-        behavior_action = batch.next_behavior_action[active]
-        target_action = next_action[active]
-        log_behavior = behavior_log_prob(
-            density,
-            batch.next_observation[active],
-            behavior_action,
-            next_times,
-        )
-        # This second call is intentional: exact density must support arbitrary
-        # candidate actions, not merely replay a stored action log-prob column.
-        log_target = behavior_log_prob(
-            density,
-            batch.next_observation[active],
-            target_action,
-            next_times,
-        )
-        finite_behavior = np.isfinite(log_behavior)
-        finite_target = np.isfinite(log_target)
-        supported_target = finite_target & (log_target >= self.min_log_density)
-        if not np.all(finite_behavior) or not np.all(supported_target):
-            self._support = {
-                "active_rows": int(np.sum(active)),
-                "finite_logged_density_fraction": float(np.mean(finite_behavior)),
-                "target_support_fraction": float(np.mean(supported_target)),
-                "minimum_required_log_density": self.min_log_density,
-            }
-            self._close_gate(
-                EstimateStatus.NO_GO_BEHAVIOR_SUPPORT,
-                "logged next actions or arbitrary candidate actions lie outside certified behavior support",
-            )
-            return None
-
-        action_scale = np.std(behavior_action, axis=0)
-        action_scale[action_scale < 1e-6] = 1.0
-        standardized_delta = (behavior_action - target_action) / action_scale
-        distance = np.linalg.norm(standardized_delta, axis=1)
-        if self.kernel_bandwidth is None:
-            positive = distance[distance > 1e-12]
-            bandwidth = float(np.median(positive)) if len(positive) else 1.0
-        else:
-            bandwidth = self.kernel_bandwidth
-        bandwidth = max(bandwidth, 1e-6)
-        log_weight = -0.5 * np.square(distance / bandwidth) - log_behavior
-        log_weight -= float(np.max(log_weight))
-        active_weight = np.exp(np.clip(log_weight, -80.0, 0.0))
-        if not np.all(np.isfinite(active_weight)) or float(np.sum(active_weight)) <= 0.0:
-            self._close_gate(EstimateStatus.NO_GO_BEHAVIOR_SUPPORT, "kernel importance weights are degenerate")
-            return None
-        active_weight /= np.mean(active_weight)
-        ess = float(
-            np.square(np.sum(active_weight)) / np.sum(np.square(active_weight))
-        )
-        active_count = int(np.sum(active))
-        ess_fraction = ess / active_count
-        weight[active] = active_weight
-        weight /= np.mean(weight)
-        self._support = {
-            "ess": ess,
-            "ess_fraction": ess_fraction,
-            "active_rows": active_count,
-            "kernel_bandwidth": bandwidth,
-            "active_weight_min": float(np.min(active_weight)),
-            "active_weight_max": float(np.max(active_weight)),
-            "target_log_density_min": float(np.min(log_target)),
-            "target_log_density_mean": float(np.mean(log_target)),
-            "behavior_log_density_min": float(np.min(log_behavior)),
-            "mean_action_distance": float(np.mean(distance)),
-            "metric_conditioning": float(np.max(action_scale) / np.min(action_scale)),
-        }
-        if ess_fraction < self.min_ess_fraction:
-            self._close_gate(
-                EstimateStatus.NO_GO_BEHAVIOR_SUPPORT,
-                f"importance-weight ESS fraction {ess_fraction:.6g} is below {self.min_ess_fraction:.6g}",
-            )
-            return None
-        return weight
 
 
 # Short aliases used by the runner without introducing a method registry layer.

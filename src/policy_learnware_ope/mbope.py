@@ -432,7 +432,14 @@ class _AutoregressiveDeltaModel:
 
 
 class _ContrastiveEnergyModel:
-    """Conditional RFF energy with NCE fitting and Langevin generation."""
+    """B22-inspired conditional RFF energy with Langevin contrastive fitting.
+
+    The trainable energy head is deliberately small: only ``theta`` is
+    optimized while the random Fourier basis and conditional center are fixed.
+    This keeps the method NumPy-only, but still permits an exact analytic VJP
+    of the B22 gradient penalty into every trainable energy parameter.  It is a
+    method-level protocol adaptation, not the upstream four-layer MLP.
+    """
 
     def __init__(
         self,
@@ -442,7 +449,19 @@ class _ContrastiveEnergyModel:
         energy_features: int,
         negatives: int,
         contrastive_steps: int,
+        epochs: int,
+        batch_size: int,
         learning_rate: float,
+        temperature: float,
+        training_langevin_steps: int,
+        training_step_size_initial: float,
+        training_step_size_final: float,
+        training_noise_scale: float,
+        training_gradient_clip: float,
+        training_drift_clip: float,
+        training_sample_clip: float,
+        gradient_penalty_margin: float,
+        gradient_penalty_weight: float,
         langevin_steps: int,
         langevin_step_size: float,
     ) -> None:
@@ -451,10 +470,30 @@ class _ContrastiveEnergyModel:
         self.energy_features = int(energy_features)
         self.negatives = int(negatives)
         self.contrastive_steps = int(contrastive_steps)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
         self.learning_rate = float(learning_rate)
+        self.temperature = float(temperature)
+        self.training_langevin_steps = int(training_langevin_steps)
+        self.training_step_size_initial = float(training_step_size_initial)
+        self.training_step_size_final = float(training_step_size_final)
+        self.training_noise_scale = float(training_noise_scale)
+        self.training_gradient_clip = float(training_gradient_clip)
+        self.training_drift_clip = float(training_drift_clip)
+        self.training_sample_clip = float(training_sample_clip)
+        self.gradient_penalty_margin = float(gradient_penalty_margin)
+        self.gradient_penalty_weight = float(gradient_penalty_weight)
         self.langevin_steps = int(langevin_steps)
         self.langevin_step_size = float(langevin_step_size)
-        if min(self.energy_features, self.negatives, self.contrastive_steps, self.langevin_steps) <= 0:
+        if min(
+            self.energy_features,
+            self.negatives,
+            self.contrastive_steps,
+            self.epochs,
+            self.batch_size,
+            self.training_langevin_steps,
+            self.langevin_steps,
+        ) <= 0:
             raise ValueError("energy feature, negative, optimization, and Langevin counts must be positive")
         self.x_scaler: _Standardizer | None = None
         self.y_scaler: _Standardizer | None = None
@@ -464,6 +503,11 @@ class _ContrastiveEnergyModel:
         self.rff_bias: np.ndarray | None = None
         self.theta: np.ndarray | None = None
         self.diagnostics: dict[str, Any] = {}
+
+    @staticmethod
+    def _require_finite(stage: str, *values: Any) -> None:
+        if any(not np.isfinite(np.asarray(value, dtype=float)).all() for value in values):
+            raise FloatingPointError(f"ETM {stage} became non-finite")
 
     def _phi(self, x: np.ndarray, residual: np.ndarray) -> np.ndarray:
         if self.rff_weight is None or self.rff_bias is None:
@@ -486,20 +530,149 @@ class _ContrastiveEnergyModel:
         energy = 0.5 * np.sum(residual**2, axis=2) + phi @ self.theta
         return energy, phi
 
-    @staticmethod
-    def _nce_loss(energy: np.ndarray) -> tuple[float, np.ndarray]:
-        logits = -energy
-        maximum = np.max(logits, axis=1, keepdims=True)
-        exponent = np.exp(logits - maximum)
-        probabilities = exponent / np.sum(exponent, axis=1, keepdims=True)
-        loss = float(
-            np.mean(energy[:, 0] + maximum[:, 0] + np.log(np.sum(exponent, axis=1)))
-        )
+    def _nce_loss(self, energy: np.ndarray) -> tuple[float, np.ndarray]:
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            logits = -energy / self.temperature
+            maximum = np.max(logits, axis=1, keepdims=True)
+            exponent = np.exp(logits - maximum)
+            probabilities = exponent / np.sum(exponent, axis=1, keepdims=True)
+            loss = float(
+                np.mean(
+                    energy[:, 0] / self.temperature
+                    + maximum[:, 0]
+                    + np.log(np.sum(exponent, axis=1))
+                )
+            )
         return loss, probabilities
 
+    def _energy_gradient(
+        self, x: np.ndarray, candidates: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return dE/dy and RFF angles for a batched candidate panel."""
+
+        if (
+            self.center is None
+            or self.residual_scale is None
+            or self.rff_weight is None
+            or self.rff_bias is None
+            or self.theta is None
+        ):
+            raise RuntimeError("energy model is not fitted")
+        center = self.center.predict(x)
+        residual = (candidates - center[:, None, :]) / self.residual_scale
+        x_repeated = np.broadcast_to(x[:, None, :], (*residual.shape[:2], x.shape[1]))
+        joint = np.concatenate([x_repeated, residual], axis=-1)
+        angle = joint @ self.rff_weight + self.rff_bias
+        target_weight = self.rff_weight[x.shape[1] :, :]
+        feature_scale = np.sqrt(2.0 / self.energy_features)
+        gradient_residual = residual - feature_scale * (
+            np.sin(angle) * self.theta
+        ) @ target_weight.T
+        return gradient_residual / self.residual_scale, angle
+
+    def _gradient_penalty(
+        self, x: np.ndarray, candidates: np.ndarray
+    ) -> tuple[float, np.ndarray, dict[str, float]]:
+        """Evaluate B22 Eq. (22) and its exact VJP into the RFF head.
+
+        Equation (22) sums penalties across the positive and generated samples
+        for one condition; this implementation then averages those per-condition
+        sums over the mini-batch.  The upstream release instead averages across
+        candidates, a documented scale difference of ``1 / (K + 1)``.
+        """
+
+        if self.residual_scale is None or self.rff_weight is None:
+            raise RuntimeError("energy model is not fitted")
+        gradient_y, angle = self._energy_gradient(x, candidates)
+        gradient_norm = np.linalg.norm(gradient_y, axis=-1)
+        excess = np.maximum(gradient_norm - self.gradient_penalty_margin, 0.0)
+        penalty = excess**2
+
+        # g = (r - c * (sin(z) * theta) B.T) / scale, hence
+        # J_theta(g)^T v = -c * sin(z) * ((v / scale) B).
+        safe_norm = np.maximum(gradient_norm, 1e-12)
+        direction = gradient_y / safe_norm[..., None]
+        target_weight = self.rff_weight[x.shape[1] :, :]
+        feature_scale = np.sqrt(2.0 / self.energy_features)
+        vjp = -feature_scale * np.sin(angle) * (
+            (direction / self.residual_scale) @ target_weight
+        )
+        sample_gradient = 2.0 * excess[..., None] * vjp
+        parameter_gradient = np.mean(np.sum(sample_gradient, axis=1), axis=0)
+        summary = {
+            "loss": float(np.mean(np.sum(penalty, axis=1))),
+            "gradient_norm_mean": float(np.mean(gradient_norm)),
+            "gradient_norm_max": float(np.max(gradient_norm)),
+            "active_rate": float(np.mean(excess > 0.0)),
+        }
+        return summary["loss"], parameter_gradient, summary
+
+    def _training_step_size(self, step: int) -> float:
+        if self.training_langevin_steps == 1:
+            return self.training_step_size_initial
+        fraction = float(step) / float(self.training_langevin_steps - 1)
+        return self.training_step_size_final + (
+            self.training_step_size_initial - self.training_step_size_final
+        ) * (1.0 - fraction) ** 2
+
+    def _langevin_negatives(
+        self, x: np.ndarray, rng: np.random.Generator
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Generate conditional training negatives using the release-code chain."""
+
+        if self.center is None:
+            raise RuntimeError("energy model is not fitted")
+        output_dim = self.center.output_dim
+        negative = rng.uniform(
+            -1.0, 1.0, size=(len(x), self.negatives, output_dim)
+        )
+        initial = negative.copy()
+        initial_energy, _ = self._energy_candidates(x, initial)
+        self._require_finite("Langevin initialization", initial, initial_energy)
+        for step in range(self.training_langevin_steps):
+            gradient, _ = self._energy_gradient(x, negative)
+            self._require_finite("Langevin gradient", gradient)
+            gradient = np.clip(
+                gradient,
+                -self.training_gradient_clip,
+                self.training_gradient_clip,
+            )
+            noise = rng.normal(size=negative.shape)
+            drift = self._training_step_size(step) * (
+                0.5 * gradient + self.training_noise_scale * noise
+            )
+            drift = np.clip(
+                drift, -self.training_drift_clip, self.training_drift_clip
+            )
+            negative = np.clip(
+                negative - drift,
+                -self.training_sample_clip,
+                self.training_sample_clip,
+            )
+            self._require_finite("Langevin update", drift, negative)
+            # NumPy has no autograd tape: using the value in the next iteration
+            # exactly realizes the upstream detach-after-each-step convention.
+        final_energy, _ = self._energy_candidates(x, negative)
+        self._require_finite("Langevin final energy", final_energy)
+        trace = {
+            "start_energy_mean": float(np.mean(initial_energy)),
+            "end_energy_mean": float(np.mean(final_energy)),
+            "mean_displacement": float(
+                np.mean(np.linalg.norm(negative - initial, axis=-1))
+            ),
+            "start_sample_mean": float(np.mean(initial)),
+            "start_sample_std": float(np.std(initial)),
+            "end_sample_mean": float(np.mean(negative)),
+            "end_sample_std": float(np.std(negative)),
+        }
+        return negative, trace
+
     def fit(self, inputs: np.ndarray, targets: np.ndarray, rng: np.random.Generator) -> None:
+        fit_started = perf_counter()
         self.x_scaler = _Standardizer.fit(inputs)
-        self.y_scaler = _Standardizer.fit(targets)
+        target_scale = np.max(np.abs(targets), axis=0)
+        target_scale = np.where(target_scale < 1e-12, 1.0, target_scale)
+        self.y_scaler = _Standardizer(np.zeros_like(target_scale), target_scale)
         x = self.x_scaler.transform(inputs)
         y = self.y_scaler.transform(targets)
         self.center = _RandomFeatureRidge(
@@ -517,55 +690,212 @@ class _ContrastiveEnergyModel:
         self.theta = np.zeros(self.energy_features, dtype=float)
         first_loss: float | None = None
         last_loss = float("nan")
+        last_gp_loss = float("nan")
         first_moment = np.zeros_like(self.theta)
         second_moment = np.zeros_like(self.theta)
-        for step in range(1, self.contrastive_steps + 1):
-            candidates = np.empty((len(y), self.negatives + 1, y.shape[1]), dtype=float)
-            candidates[:, 0] = y
-            for negative in range(self.negatives):
-                permutation = rng.permutation(len(y))
-                candidates[:, negative + 1] = y[permutation]
-                # Prevent fixed points from becoming mislabeled negatives.
-                same = permutation == np.arange(len(y))
-                if np.any(same):
-                    candidates[same, negative + 1] += rng.normal(
-                        scale=0.5, size=(int(np.sum(same)), y.shape[1])
+        negative_sampling_seconds = 0.0
+        gradient_penalty_seconds = 0.0
+        backward_seconds = 0.0
+        nce_seconds = 0.0
+        optimizer_updates = 0
+        epochs_entered = 0
+        condition_rows = 0
+        chain_start_energy: list[float] = []
+        chain_end_energy: list[float] = []
+        chain_displacement: list[float] = []
+        grad_norm_means: list[float] = []
+        grad_norm_maxes: list[float] = []
+        penalty_active_rates: list[float] = []
+        latest_trace: dict[str, Any] = {}
+
+        for epoch in range(self.epochs):
+            permutation = rng.permutation(len(y))
+            for start in range(0, len(y), self.batch_size):
+                if optimizer_updates >= self.contrastive_steps:
+                    break
+                rows = permutation[start : start + self.batch_size]
+                x_batch = x[rows]
+                y_batch = y[rows]
+
+                negative_started = perf_counter()
+                negatives, latest_trace = self._langevin_negatives(x_batch, rng)
+                negative_sampling_seconds += perf_counter() - negative_started
+                candidates = np.concatenate([y_batch[:, None, :], negatives], axis=1)
+
+                nce_started = perf_counter()
+                energy, phi = self._energy_candidates(x_batch, candidates)
+                loss, probability = self._nce_loss(energy)
+                self._require_finite("InfoNCE", energy, phi, loss, probability)
+                nce_gradient = np.mean(
+                    (
+                        phi[:, 0]
+                        - np.sum(probability[:, :, None] * phi, axis=1)
                     )
-            energy, phi = self._energy_candidates(x, candidates)
-            loss, probability = self._nce_loss(energy)
-            if first_loss is None:
-                first_loss = loss
-            # d(E_pos + logsumexp(-E))/d theta
-            gradient = np.mean(
-                phi[:, 0] - np.sum(probability[:, :, None] * phi, axis=1), axis=0
-            )
-            gradient += self.ridge * self.theta
-            first_moment = 0.9 * first_moment + 0.1 * gradient
-            second_moment = 0.999 * second_moment + 0.001 * gradient**2
-            corrected_first = first_moment / (1.0 - 0.9**step)
-            corrected_second = second_moment / (1.0 - 0.999**step)
-            self.theta -= self.learning_rate * corrected_first / (
-                np.sqrt(corrected_second) + 1e-8
-            )
-            last_loss = loss
-        # Evaluate a fresh, deterministic-size contrastive panel after the update.
-        candidates = np.empty((len(y), self.negatives + 1, y.shape[1]), dtype=float)
-        candidates[:, 0] = y
-        for negative in range(self.negatives):
-            candidates[:, negative + 1] = y[rng.permutation(len(y))]
-        energy, _ = self._energy_candidates(x, candidates)
+                    / self.temperature,
+                    axis=0,
+                )
+                self._require_finite("InfoNCE gradient", nce_gradient)
+                nce_seconds += perf_counter() - nce_started
+
+                gp_started = perf_counter()
+                gp_loss, gp_gradient, gp_summary = self._gradient_penalty(
+                    x_batch, candidates
+                )
+                self._require_finite(
+                    "gradient penalty",
+                    gp_loss,
+                    gp_gradient,
+                    list(gp_summary.values()),
+                )
+                gradient_penalty_seconds += perf_counter() - gp_started
+
+                backward_started = perf_counter()
+                gradient = (
+                    nce_gradient
+                    + self.gradient_penalty_weight * gp_gradient
+                    + self.ridge * self.theta
+                )
+                self._require_finite("parameter gradient", gradient)
+                optimizer_updates += 1
+                with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                    first_moment = 0.9 * first_moment + 0.1 * gradient
+                    second_moment = 0.999 * second_moment + 0.001 * gradient**2
+                    corrected_first = first_moment / (1.0 - 0.9**optimizer_updates)
+                    corrected_second = second_moment / (1.0 - 0.999**optimizer_updates)
+                self._require_finite(
+                    "Adam state",
+                    first_moment,
+                    second_moment,
+                    corrected_first,
+                    corrected_second,
+                )
+                self.theta -= self.learning_rate * corrected_first / (
+                    np.sqrt(corrected_second) + 1e-8
+                )
+                self._require_finite("parameter update", self.theta)
+                backward_seconds += perf_counter() - backward_started
+
+                if first_loss is None:
+                    first_loss = loss
+                last_loss = loss
+                last_gp_loss = gp_loss
+                condition_rows += len(rows)
+                chain_start_energy.append(latest_trace["start_energy_mean"])
+                chain_end_energy.append(latest_trace["end_energy_mean"])
+                chain_displacement.append(latest_trace["mean_displacement"])
+                grad_norm_means.append(gp_summary["gradient_norm_mean"])
+                grad_norm_maxes.append(gp_summary["gradient_norm_max"])
+                penalty_active_rates.append(gp_summary["active_rate"])
+            epochs_entered = epoch + 1
+            if optimizer_updates >= self.contrastive_steps:
+                break
+        if optimizer_updates == 0 or first_loss is None:
+            raise RuntimeError("ETM training produced no optimizer update")
+
+        # Evaluate a fresh conditional Langevin panel after the final update.
+        panel_rows = np.arange(min(len(y), self.batch_size))
+        panel_x = x[panel_rows]
+        panel_y = y[panel_rows]
+        panel_negatives, panel_trace = self._langevin_negatives(panel_x, rng)
+        candidates = np.concatenate([panel_y[:, None, :], panel_negatives], axis=1)
+        energy, _ = self._energy_candidates(panel_x, candidates)
         final_loss, _ = self._nce_loss(energy)
         energy_gap = float(np.mean(energy[:, 1:]) - np.mean(energy[:, 0]))
+        self._require_finite("final contrastive panel", energy, final_loss, energy_gap)
         self.diagnostics = {
             "conditional_energy": "quadratic_base_plus_learned_joint_RFF_energy",
-            "contrastive_objective": "InfoNCE_with_replay_negatives",
+            "contrastive_objective": "InfoNCE_with_conditional_Langevin_negatives",
+            "training_negative_sampler": "conditional_batched_Langevin",
+            "shuffle_or_replay_negatives_used": False,
+            "negative_initialization": "uniform[-1,1]_normalized_target",
             "contrastive_steps": self.contrastive_steps,
+            "optimizer_update_count": optimizer_updates,
+            "configured_epochs": self.epochs,
+            "epochs_entered": epochs_entered,
+            "batch_size": self.batch_size,
             "contrastive_loss_initial": float(first_loss),
             "contrastive_loss_last_training_batch": float(last_loss),
             "contrastive_loss_final_panel": final_loss,
             "positive_negative_energy_gap": energy_gap,
             "negative_candidates": self.negatives,
             "energy_features": self.energy_features,
+            "softmax_temperature": self.temperature,
+            "training_langevin_steps": self.training_langevin_steps,
+            "training_step_size_initial": self.training_step_size_initial,
+            "training_step_size_final": self.training_step_size_final,
+            "training_step_schedule": "official_release_polynomial_power_2",
+            "training_langevin_noise_scale": self.training_noise_scale,
+            "training_gradient_clip": self.training_gradient_clip,
+            "training_drift_clip": self.training_drift_clip,
+            "training_sample_clip": self.training_sample_clip,
+            "training_chain_start_energy_mean": float(np.mean(chain_start_energy)),
+            "training_chain_end_energy_mean": float(np.mean(chain_end_energy)),
+            "training_chain_mean_displacement": float(np.mean(chain_displacement)),
+            "final_panel_chain_start_energy": panel_trace["start_energy_mean"],
+            "final_panel_chain_end_energy": panel_trace["end_energy_mean"],
+            "final_panel_chain_mean_displacement": panel_trace["mean_displacement"],
+            "langevin_negative_chain_count": condition_rows * self.negatives,
+            "langevin_negative_step_count": condition_rows
+            * self.negatives
+            * self.training_langevin_steps,
+            "gradient_penalty_formula": "sum_j_relu(norm_dE_dtarget_minus_margin)^2",
+            "gradient_penalty_vjp": "exact_analytic_into_trainable_RFF_theta",
+            "gradient_penalty_reduction": "sum_candidates_then_mean_batch",
+            "gradient_penalty_margin": self.gradient_penalty_margin,
+            "gradient_penalty_weight": self.gradient_penalty_weight,
+            "gradient_penalty_last": float(last_gp_loss),
+            "gradient_norm_mean": float(np.mean(grad_norm_means)),
+            "gradient_norm_max": float(np.max(grad_norm_maxes)),
+            "gradient_penalty_active_rate": float(np.mean(penalty_active_rates)),
+            "gradient_penalty_evaluation_count": condition_rows
+            * (self.negatives + 1),
+            "negative_sampling_seconds": negative_sampling_seconds,
+            "nce_seconds": nce_seconds,
+            "gradient_penalty_seconds": gradient_penalty_seconds,
+            "analytic_backward_seconds": backward_seconds,
+            "energy_fit_seconds": perf_counter() - fit_started,
+            "theta_l2": float(np.linalg.norm(self.theta)),
+            "actual_training_config": {
+                "hidden_dim": self.hidden_dim,
+                "ridge": self.ridge,
+                "energy_features": self.energy_features,
+                "generated_negative_chains_per_condition": self.negatives,
+                "positive_candidates_per_condition": 1,
+                "maximum_optimizer_updates": self.contrastive_steps,
+                "epochs": self.epochs,
+                "batch_size": self.batch_size,
+                "learning_rate": self.learning_rate,
+                "optimizer": "Adam",
+                "adam_beta1": 0.9,
+                "adam_beta2": 0.999,
+                "adam_epsilon": 1e-8,
+                "softmax_temperature": self.temperature,
+                "target_normalization": "zero_mean_max_abs_box",
+                "target_scale_floor_rule": "max_abs_below_1e-12_uses_1.0",
+                "residual_scale_floor": 0.15,
+                "training_langevin_steps": self.training_langevin_steps,
+                "training_step_size_initial": self.training_step_size_initial,
+                "training_step_size_final": self.training_step_size_final,
+                "training_step_schedule": "polynomial_power_2",
+                "training_noise_scale": self.training_noise_scale,
+                "training_gradient_clip": self.training_gradient_clip,
+                "training_drift_clip": self.training_drift_clip,
+                "training_sample_clip": self.training_sample_clip,
+                "gradient_penalty_margin": self.gradient_penalty_margin,
+                "gradient_penalty_weight": self.gradient_penalty_weight,
+                "gradient_penalty_reduction": "sum_candidates_then_mean_batch",
+                "inference_langevin_steps": self.langevin_steps,
+                "inference_langevin_step_size": self.langevin_step_size,
+                "inference_noise_scale": 1.0,
+                "inference_sample_clip": 10.0,
+            },
+            "paper_protocol_reference": "B22_2024_Eq22_Eq23_Table2",
+            "official_source_commit": "2a2c780c0da074b6e7733a3cb6b40b2444452de6",
+            "remaining_upstream_drift": [
+                "fixed_random_Fourier_basis_and_ridge_center_replace_four_layer_trainable_MLP",
+                "training chain selects the official release polynomial schedule rather than paper Eq23 epsilon-squared drift",
+                "no_claim_of_official_benchmark_numerical_parity",
+            ],
             "inference_sampler": "Langevin",
             "langevin_steps": self.langevin_steps,
             "langevin_step_size": self.langevin_step_size,
@@ -1083,17 +1413,18 @@ class ARMBOPEEstimator(_BaseMBOPE):
 
 
 class ETMMBOPEEstimator(_BaseMBOPE):
-    """Contrastive conditional-energy transition model with Langevin rollout."""
+    """B22 protocol adaptation with Langevin training and rollout."""
 
     method_family = "ETM_MBOPE"
     identity = {
         "family": "contrastive_energy_transition_model_ope",
-        "scientific_role": "PROJECT_CONTRASTIVE_ENERGY_ADAPTATION_PROXY",
+        "scientific_role": "PROJECT_ETM_PROTOCOL_ADAPTATION",
         "project_adaptation": True,
-        "implementation_scope": "EXECUTABLE_PROJECT_REFERENCE_PROXY",
+        "implementation_scope": "EXECUTABLE_METHOD_LEVEL_PROTOCOL_ADAPTATION",
         "upstream_parity_claimed": False,
-        "fit": "InfoNCE",
+        "fit": "conditional_Langevin_InfoNCE_plus_exact_RFF_gradient_penalty_VJP",
         "generation": "Langevin_energy_sampling",
+        "upstream_source_commit": "2a2c780c0da074b6e7733a3cb6b40b2444452de6",
         "distinct_from_families": ["DOPE_STYLE_MB_FF", "AR_MBOPE"],
     }
     member_count = 1
@@ -1109,7 +1440,19 @@ class ETMMBOPEEstimator(_BaseMBOPE):
         energy_features: int = 64,
         negatives: int = 4,
         contrastive_steps: int = 80,
+        epochs: int = 20,
+        batch_size: int = 64,
         learning_rate: float = 0.02,
+        temperature: float = 1.0,
+        training_langevin_steps: int = 5,
+        training_step_size_initial: float = 0.1,
+        training_step_size_final: float = 1e-3,
+        training_noise_scale: float = 0.5,
+        training_gradient_clip: float = 10.0,
+        training_drift_clip: float = 0.5,
+        training_sample_clip: float = 1.1,
+        gradient_penalty_margin: float = 5.0,
+        gradient_penalty_weight: float = 1.0,
         langevin_steps: int = 20,
         langevin_step_size: float = 0.04,
         termination_function: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
@@ -1128,6 +1471,9 @@ class ETMMBOPEEstimator(_BaseMBOPE):
             "energy_features": energy_features,
             "negatives": negatives,
             "contrastive_steps": contrastive_steps,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "training_langevin_steps": training_langevin_steps,
             "langevin_steps": langevin_steps,
         }
         if any(
@@ -1139,6 +1485,12 @@ class ETMMBOPEEstimator(_BaseMBOPE):
             raise ValueError("ETM dimensions and step counts must be positive integers")
         for name, value in {
             "learning_rate": learning_rate,
+            "temperature": temperature,
+            "training_step_size_initial": training_step_size_initial,
+            "training_step_size_final": training_step_size_final,
+            "training_gradient_clip": training_gradient_clip,
+            "training_drift_clip": training_drift_clip,
+            "training_sample_clip": training_sample_clip,
             "langevin_step_size": langevin_step_size,
         }.items():
             if (
@@ -1148,11 +1500,39 @@ class ETMMBOPEEstimator(_BaseMBOPE):
                 or float(value) <= 0.0
             ):
                 raise ValueError(f"{name} must be finite and positive")
+        for name, value in {
+            "training_noise_scale": training_noise_scale,
+            "gradient_penalty_margin": gradient_penalty_margin,
+            "gradient_penalty_weight": gradient_penalty_weight,
+        }.items():
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, float, np.integer, np.floating))
+                or not np.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise ValueError(f"{name} must be finite and non-negative")
+        if float(training_step_size_final) > float(training_step_size_initial):
+            raise ValueError(
+                "training_step_size_final must not exceed training_step_size_initial"
+            )
         self.hidden_dim = int(hidden_dim)
         self.energy_features = int(energy_features)
         self.negatives = int(negatives)
         self.contrastive_steps = int(contrastive_steps)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
         self.learning_rate = float(learning_rate)
+        self.temperature = float(temperature)
+        self.training_langevin_steps = int(training_langevin_steps)
+        self.training_step_size_initial = float(training_step_size_initial)
+        self.training_step_size_final = float(training_step_size_final)
+        self.training_noise_scale = float(training_noise_scale)
+        self.training_gradient_clip = float(training_gradient_clip)
+        self.training_drift_clip = float(training_drift_clip)
+        self.training_sample_clip = float(training_sample_clip)
+        self.gradient_penalty_margin = float(gradient_penalty_margin)
+        self.gradient_penalty_weight = float(gradient_penalty_weight)
         self.langevin_steps = int(langevin_steps)
         self.langevin_step_size = float(langevin_step_size)
 
@@ -1164,7 +1544,19 @@ class ETMMBOPEEstimator(_BaseMBOPE):
             energy_features=self.energy_features,
             negatives=self.negatives,
             contrastive_steps=self.contrastive_steps,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
             learning_rate=self.learning_rate,
+            temperature=self.temperature,
+            training_langevin_steps=self.training_langevin_steps,
+            training_step_size_initial=self.training_step_size_initial,
+            training_step_size_final=self.training_step_size_final,
+            training_noise_scale=self.training_noise_scale,
+            training_gradient_clip=self.training_gradient_clip,
+            training_drift_clip=self.training_drift_clip,
+            training_sample_clip=self.training_sample_clip,
+            gradient_penalty_margin=self.gradient_penalty_margin,
+            gradient_penalty_weight=self.gradient_penalty_weight,
             langevin_steps=self.langevin_steps,
             langevin_step_size=self.langevin_step_size,
         )

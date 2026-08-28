@@ -353,17 +353,21 @@ def _toy_method_scope(method_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
             scopes[method_id] = {
                 "status": "TOY_MVP_PASS",
                 "scope": (
-                    "KMIFQE project adaptation with an exact-density fixture; "
-                    "full learned-Hessian reference parity is deferred"
+                    "B20 protocol adaptation with nonlinear candidate critic, local "
+                    "Hessian metric, estimated bandwidth, replacement resampling, "
+                    "and logged-adjacent-action TD"
                 ),
-                "scientific_role": "PROJECT_ADAPTATION",
+                "scientific_role": "B20_PROTOCOL_ADAPTATION",
                 "official_paper_parity": False,
             }
         elif method_id.startswith("ETM_MBOPE_"):
             scopes[method_id] = {
                 "status": "TOY_MVP_PASS",
-                "scope": "compact contrastive-energy/Langevin project proxy",
-                "scientific_role": "PROJECT_CONTRASTIVE_ENERGY_ADAPTATION_PROXY",
+                "scope": (
+                    "B22 protocol adaptation with conditional training-time Langevin "
+                    "negatives and an exact RFF gradient-penalty VJP"
+                ),
+                "scientific_role": "PROJECT_ETM_PROTOCOL_ADAPTATION",
                 "official_paper_parity": False,
             }
         elif method_id.startswith("DOPE_STYLE_MB_FF_"):
@@ -423,7 +427,19 @@ def run_toy(
                 "energy_features": 48,
                 "negatives": 3,
                 "contrastive_steps": 40,
+                "epochs": 12,
+                "batch_size": 48,
                 "learning_rate": 0.01,
+                "temperature": 1.0,
+                "training_langevin_steps": 5,
+                "training_step_size_initial": 0.1,
+                "training_step_size_final": 0.001,
+                "training_noise_scale": 0.5,
+                "training_gradient_clip": 10.0,
+                "training_drift_clip": 0.5,
+                "training_sample_clip": 1.1,
+                "gradient_penalty_margin": 5.0,
+                "gradient_penalty_weight": 1.0,
                 "langevin_steps": 10,
                 "langevin_step_size": 0.025,
             },
@@ -439,6 +455,11 @@ def run_toy(
             {"ensemble_members": 2, "hidden_dim": 20},
         ),
     ]
+    model_common = {
+        "ridge": 1e-4,
+        "rollouts_per_initial": 12,
+        "termination_mode": "horizon_only",
+    }
     config: dict[str, Any] = {
         "schema": "policy-learnware.toy-config.v2",
         "seed": seed,
@@ -452,8 +473,27 @@ def run_toy(
             "max_iterations": 2500,
             "tolerance": 1e-8,
         },
+        "kmifqe": {
+            "ridge": 1e-7,
+            "max_iterations": 200,
+            "tolerance": 3e-3,
+            "critic_features": 32,
+            "eigenvalue_floor": 1e-6,
+            "metric_regularization": 0.1,
+            "bandwidth_floor": 1e-3,
+            "bandwidth_ceiling": 10.0,
+            "ratio_clip_min": 1e-3,
+            "ratio_clip_max": 2.0,
+            "target_density_floor": 1e-12,
+            "target_update_interval": 1,
+            "critic_step_size": 0.1,
+            "probability_tolerance": 0.015,
+            "min_log_density": -50.0,
+            "min_ess_fraction": 0.01,
+            "resample_size": None,
+        },
         "model_based": {family: kwargs for _, family, kwargs in model_specs},
-        "rollouts_per_initial": 12,
+        "model_common": model_common,
     }
     config_digest = _payload_digest(config)
     batch = _toy_batch(seed)
@@ -468,12 +508,15 @@ def run_toy(
         method_estimates: dict[str, ValueEstimate] = {}
         actual_method_id: str | None = None
         for candidate_index, candidate in enumerate(candidates):
+            estimator_config = (
+                config["kmifqe"]
+                if estimator_type is FiniteHorizonKMIFQE
+                else config["fqe"]
+            )
             estimator = estimator_type(
                 gamma=TOY_GAMMA,
                 horizon=TOY_HORIZON,
-                ridge=1e-7,
-                max_iterations=2500,
-                tolerance=1e-8,
+                **estimator_config,
             )
             if actual_method_id is None:
                 actual_method_id = estimator.method_id
@@ -497,8 +540,8 @@ def run_toy(
             selector_id,
             gamma=TOY_GAMMA,
             horizon=TOY_HORIZON,
-            rollouts_per_initial=12,
-            ridge=1e-4,
+            rollouts_per_initial=model_common["rollouts_per_initial"],
+            ridge=model_common["ridge"],
             **model_kwargs,
         ).fit(
             batch,

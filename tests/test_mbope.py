@@ -231,9 +231,15 @@ def test_method_identity_and_faithfulness_diagnostics_are_distinct() -> None:
     energy = energy_result.diagnostics
     assert (
         energy_result.provenance["scientific_role"]
-        == "PROJECT_CONTRASTIVE_ENERGY_ADAPTATION_PROXY"
+        == "PROJECT_ETM_PROTOCOL_ADAPTATION"
     )
-    assert energy["contrastive_objective"] == "InfoNCE_with_replay_negatives"
+    assert (
+        energy["contrastive_objective"]
+        == "InfoNCE_with_conditional_Langevin_negatives"
+    )
+    assert energy["training_negative_sampler"] == "conditional_batched_Langevin"
+    assert energy["shuffle_or_replay_negatives_used"] is False
+    assert energy["gradient_penalty_vjp"] == "exact_analytic_into_trainable_RFF_theta"
     assert energy["inference_sampler"] == "Langevin"
     assert energy["contrastive_steps"] == 45
     assert energy["langevin_steps"] == 10
@@ -247,6 +253,13 @@ def test_model_based_configuration_and_failed_refit_fail_closed() -> None:
         ETMMBOPEEstimator(learning_rate=0.0)
     with pytest.raises(ValueError, match="langevin_step_size"):
         ETMMBOPEEstimator(langevin_step_size=0.0)
+    with pytest.raises(ValueError, match="training_noise_scale"):
+        ETMMBOPEEstimator(training_noise_scale=-0.1)
+    with pytest.raises(ValueError, match="step_size_final"):
+        ETMMBOPEEstimator(
+            training_step_size_initial=0.01,
+            training_step_size_final=0.02,
+        )
 
     estimator = DOPEStyleMBFFEstimator(
         horizon=5,
@@ -394,3 +407,215 @@ def test_method_ids_keys_and_bound_actor_abi_are_strict() -> None:
             keys=np.asarray([2]),
             candidate=MissingSemanticsActor(),
         )
+
+
+def _small_etm(**overrides: object) -> ETMMBOPEEstimator:
+    config: dict[str, object] = {
+        "horizon": 5,
+        "rollouts_per_initial": 3,
+        "hidden_dim": 12,
+        "energy_features": 24,
+        "negatives": 2,
+        "contrastive_steps": 8,
+        "epochs": 4,
+        "batch_size": 25,
+        "learning_rate": 0.008,
+        "temperature": 1.0,
+        "training_langevin_steps": 4,
+        "training_step_size_initial": 0.08,
+        "training_step_size_final": 0.01,
+        "training_noise_scale": 0.25,
+        "training_gradient_clip": 5.0,
+        "training_drift_clip": 0.3,
+        "training_sample_clip": 1.1,
+        "gradient_penalty_margin": 0.0,
+        "gradient_penalty_weight": 0.2,
+        "langevin_steps": 4,
+        "langevin_step_size": 0.02,
+    }
+    config.update(overrides)
+    return ETMMBOPEEstimator(**config)
+
+
+def test_etm_training_negatives_are_conditional_langevin_and_seed_reproducible() -> None:
+    batch = _linear_batch(episodes=20, seed=19)
+    first = _small_etm().fit(
+        batch, LinearActor(), fit_keys=np.asarray([123, 456], dtype=np.uint64)
+    )
+    second = _small_etm().fit(
+        batch, LinearActor(), fit_keys=np.asarray([123, 456], dtype=np.uint64)
+    )
+    first_diagnostics = first._fit_diagnostics
+    second_diagnostics = second._fit_diagnostics
+
+    assert first._model is not None and second._model is not None
+    np.testing.assert_allclose(
+        first._model.theta, second._model.theta, rtol=1e-9, atol=1e-10
+    )
+    assert first_diagnostics["optimizer_update_count"] == 8
+    assert first_diagnostics["training_langevin_steps"] == 4
+    assert first_diagnostics["batch_size"] == 25
+    assert first_diagnostics["configured_epochs"] == 4
+    assert first_diagnostics["epochs_entered"] == 2
+    assert first_diagnostics["langevin_negative_chain_count"] > 0
+    assert first_diagnostics["langevin_negative_step_count"] > 0
+    assert first_diagnostics["training_chain_mean_displacement"] > 0.0
+    assert first_diagnostics["final_panel_chain_mean_displacement"] > 0.0
+    assert not np.isclose(
+        first_diagnostics["training_chain_start_energy_mean"],
+        first_diagnostics["training_chain_end_energy_mean"],
+        rtol=1e-9,
+        atol=1e-10,
+    )
+    assert not np.isclose(
+        first_diagnostics["final_panel_chain_start_energy"],
+        first_diagnostics["final_panel_chain_end_energy"],
+        rtol=1e-9,
+        atol=1e-10,
+    )
+    config = first_diagnostics["actual_training_config"]
+    assert config["target_normalization"] == "zero_mean_max_abs_box"
+    assert config["optimizer"] == "Adam"
+    for key in (
+        "negative_sampling_seconds",
+        "gradient_penalty_seconds",
+        "analytic_backward_seconds",
+        "energy_fit_seconds",
+    ):
+        assert np.isfinite(first_diagnostics[key])
+        assert first_diagnostics[key] >= 0.0
+
+    model = first._model
+    assert model is not None and model.x_scaler is not None and model.y_scaler is not None
+    raw_targets = np.concatenate(
+        [
+            batch.next_observation - batch.observation,
+            batch.reward[:, None],
+        ],
+        axis=1,
+    )
+    box_targets = model.y_scaler.transform(raw_targets)
+    np.testing.assert_allclose(model.y_scaler.mean, 0.0, rtol=0.0, atol=0.0)
+    assert np.max(np.abs(box_targets)) <= 1.0 + 1e-12
+    raw_inputs = np.concatenate(
+        [
+            batch.observation,
+            batch.action,
+            batch.native_timestep[:, None] / 5.0,
+        ],
+        axis=1,
+    )
+    normalized = model.x_scaler.transform(raw_inputs)
+    left, left_trace = model._langevin_negatives(
+        normalized[[0, 1]], np.random.default_rng(991)
+    )
+    right, right_trace = model._langevin_negatives(
+        normalized[[-2, -1]], np.random.default_rng(991)
+    )
+    # Equal seeds give the same uniform starts and noise.  Different conditions
+    # still produce different chain endpoints, proving conditional generation.
+    assert left_trace["start_sample_mean"] == pytest.approx(
+        right_trace["start_sample_mean"], rel=1e-9, abs=1e-10
+    )
+    assert left_trace["start_sample_std"] == pytest.approx(
+        right_trace["start_sample_std"], rel=1e-9, abs=1e-10
+    )
+    assert not np.allclose(left, right)
+    assert left_trace["mean_displacement"] > 0.0
+
+    initial = np.asarray([[-0.4], [0.6]])
+    rollout_keys = np.asarray([71, 72], dtype=np.uint64)
+    first_value = first.estimate(initial, keys=rollout_keys).value
+    second_value = second.estimate(initial, keys=rollout_keys).value
+    assert np.isfinite(first_value)
+    assert first_value == pytest.approx(second_value, rel=1e-9, abs=1e-10)
+
+
+def test_etm_non_finite_training_fails_before_publishing_model() -> None:
+    batch = _linear_batch(episodes=4, seed=29)
+    estimator = _small_etm(
+        contrastive_steps=1,
+        epochs=1,
+        batch_size=20,
+    ).fit(batch, LinearActor(), fit_keys=np.asarray([81], dtype=np.uint64))
+    estimator.temperature = 1e-320
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        estimator.fit(batch, LinearActor(), fit_keys=np.asarray([82], dtype=np.uint64))
+    with pytest.raises(RuntimeError, match="fit must be called"):
+        estimator.estimate(np.asarray([[0.0]]), keys=np.asarray([3], dtype=np.uint64))
+
+    overflowing_adam = _small_etm(
+        contrastive_steps=1,
+        epochs=1,
+        batch_size=20,
+        gradient_penalty_weight=1e200,
+    )
+    with pytest.raises(FloatingPointError, match="Adam state"):
+        overflowing_adam.fit(
+            batch, LinearActor(), fit_keys=np.asarray([83], dtype=np.uint64)
+        )
+    with pytest.raises(RuntimeError, match="fit must be called"):
+        overflowing_adam.estimate(
+            np.asarray([[0.0]]), keys=np.asarray([4], dtype=np.uint64)
+        )
+
+
+def test_etm_gradient_penalty_vjp_matches_finite_difference_and_changes_update() -> None:
+    batch = _linear_batch(episodes=20, seed=23)
+    keys = np.asarray([771], dtype=np.uint64)
+    without_penalty = _small_etm(gradient_penalty_weight=0.0).fit(
+        batch, LinearActor(), fit_keys=keys
+    )
+    with_penalty = _small_etm(gradient_penalty_weight=0.2).fit(
+        batch, LinearActor(), fit_keys=keys
+    )
+    without_diagnostics = without_penalty._fit_diagnostics
+    with_diagnostics = with_penalty._fit_diagnostics
+    assert with_diagnostics["gradient_penalty_last"] > 0.0
+    assert with_diagnostics["gradient_penalty_active_rate"] == pytest.approx(1.0)
+    assert without_penalty._model is not None and with_penalty._model is not None
+    assert not np.allclose(
+        without_penalty._model.theta,
+        with_penalty._model.theta,
+        rtol=1e-8,
+        atol=1e-10,
+    )
+
+    model = with_penalty._model
+    assert model is not None and model.x_scaler is not None and model.y_scaler is not None
+    assert model.theta is not None
+    raw_inputs = np.concatenate(
+        [
+            batch.observation[:3],
+            batch.action[:3],
+            batch.native_timestep[:3, None] / 5.0,
+        ],
+        axis=1,
+    )
+    x = model.x_scaler.transform(raw_inputs)
+    positive = np.concatenate(
+        [
+            batch.next_observation[:3] - batch.observation[:3],
+            batch.reward[:3, None],
+        ],
+        axis=1,
+    )
+    positive = model.y_scaler.transform(positive)
+    generated, _ = model._langevin_negatives(x, np.random.default_rng(4567))
+    candidates = np.concatenate([positive[:, None, :], generated], axis=1)
+    _, analytic_gradient, _ = model._gradient_penalty(x, candidates)
+
+    baseline = model.theta.copy()
+    epsilon = 1e-6
+    for index in range(3):
+        model.theta = baseline.copy()
+        model.theta[index] += epsilon
+        plus, _, _ = model._gradient_penalty(x, candidates)
+        model.theta = baseline.copy()
+        model.theta[index] -= epsilon
+        minus, _, _ = model._gradient_penalty(x, candidates)
+        finite_difference = (plus - minus) / (2.0 * epsilon)
+        assert analytic_gradient[index] == pytest.approx(
+            finite_difference, rel=2e-5, abs=2e-6
+        )
+    model.theta = baseline

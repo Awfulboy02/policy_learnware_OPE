@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pytest
@@ -374,8 +375,9 @@ def test_kmifqe_recovers_known_value_and_queries_arbitrary_density() -> None:
         gamma=0.99,
         horizon=3,
         ridge=1e-10,
-        max_iterations=20,
-        tolerance=1e-11,
+        max_iterations=600,
+        tolerance=1e-9,
+        critic_step_size=1.0,
     ).fit(
         batch,
         actor,
@@ -389,12 +391,13 @@ def test_kmifqe_recovers_known_value_and_queries_arbitrary_density() -> None:
     assert result.value == pytest.approx(1.0 + 0.99 + 0.99**2, abs=2e-6)
     assert result.support["ess"] == pytest.approx(2 * batch.episode_count)
     assert result.support["ess_fraction"] == pytest.approx(1.0)
-    assert result.provenance["method_identity"] == "KMIFQE_PROJECT_ADAPTATION"
+    assert result.provenance["method_identity"] == "B20_PROTOCOL_ADAPTATION"
     assert result.provenance["official_parity"] is False
     # One exact-density query for logged a' and another for pi(s').
     assert len(density.calls) == 2
     np.testing.assert_array_equal(density.calls[0], 0.0)
     np.testing.assert_array_equal(density.calls[1], 0.25)
+    assert result.support["verified_adjacent_rows"] == result.support["active_rows"]
 
 
 def test_kmifqe_existing_density_and_next_action_gates() -> None:
@@ -449,6 +452,23 @@ def test_kmifqe_existing_density_and_next_action_gates() -> None:
         keys=np.array([4], dtype=np.uint64),
     )
     assert stochastic_result.status is EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS
+
+    inconsistent = replace(
+        batch,
+        next_behavior_action=np.ones_like(batch.action),
+        source_digest="synthetic-inconsistent-adjacency",
+    )
+    inconsistent_estimator = FiniteHorizonKMIFQE(horizon=3).fit(
+        inconsistent,
+        actor,
+        behavior_density=GaussianDensity(),
+        fit_keys=np.arange(len(inconsistent), dtype=np.uint64),
+    )
+    inconsistent_result = inconsistent_estimator.estimate(
+        np.zeros((1, 1)), keys=np.array([5], dtype=np.uint64)
+    )
+    assert inconsistent_result.status is EstimateStatus.INVALID_DATA
+    assert "contiguous logged successor" in inconsistent_result.diagnostics["gate_detail"]
 
 
 def test_kmifqe_fails_closed_outside_behavior_support() -> None:
@@ -506,4 +526,80 @@ def test_kmifqe_ess_gate_uses_only_active_bellman_rows() -> None:
     )
     assert result.status is EstimateStatus.NO_GO_BEHAVIOR_SUPPORT
     assert result.support["active_rows"] == 2
-    assert result.support["ess_fraction"] == pytest.approx(0.5, abs=1e-6)
+    # B20 protocol clipping keeps the tiny row at the configured positive
+    # floor, so ESS is slightly above the unclipped limiting value 0.5.
+    assert 0.5 < result.support["ess_fraction"] < 0.55
+    assert result.diagnostics["td_loss"] is None
+    json.dumps(result.to_dict(), allow_nan=False)
+
+
+def test_kmifqe_stale_target_cannot_claim_convergence() -> None:
+    batch = known_mdp_batch()
+    estimator = FiniteHorizonKMIFQE(
+        gamma=0.99,
+        horizon=3,
+        ridge=1e-10,
+        max_iterations=20,
+        tolerance=1e-8,
+        target_update_interval=100,
+        critic_step_size=1.0,
+    ).fit(
+        batch,
+        ConstantActor(),
+        behavior_density=GaussianDensity(),
+        fit_keys=np.arange(len(batch), dtype=np.uint64),
+    )
+    result = estimator.estimate(
+        np.zeros((1, 1)), keys=np.array([17], dtype=np.uint64)
+    )
+
+    assert result.status is EstimateStatus.NO_GO_FIT_CONVERGENCE
+    assert result.value is None
+    assert result.diagnostics["target_update_count"] == 1
+    assert result.diagnostics["alternating_update_count"] == 20
+    assert result.diagnostics["target_lag_history"][-1] > result.diagnostics[
+        "final_q_tolerance"
+    ]
+
+
+def test_kmifqe_nonfinite_internal_state_fails_without_publishing_a_model() -> None:
+    batch = known_mdp_batch(episodes=2)
+    extreme_state = np.where(
+        np.arange(len(batch))[:, None] % 2 == 0,
+        1e308,
+        -1e308,
+    )
+    extreme = replace(
+        batch,
+        observation=extreme_state,
+        next_observation=extreme_state.copy(),
+        source_digest="synthetic-extreme-finite-state",
+    )
+    estimator = FiniteHorizonKMIFQE(horizon=3, max_iterations=5).fit(
+        extreme,
+        ConstantActor(),
+        behavior_density=GaussianDensity(),
+        fit_keys=np.arange(len(extreme), dtype=np.uint64),
+    )
+    result = estimator.estimate(
+        np.zeros((1, 1)), keys=np.array([19], dtype=np.uint64)
+    )
+
+    assert result.status is EstimateStatus.FAILED
+    assert result.value is None
+    assert "non-finite" in result.diagnostics["gate_detail"]
+    json.dumps(result.to_dict(), allow_nan=False)
+
+    huge_action = FiniteHorizonKMIFQE(horizon=3, max_iterations=5).fit(
+        batch,
+        ConstantActor(value=1e200),
+        behavior_density=GaussianDensity(),
+        fit_keys=np.arange(len(batch), dtype=np.uint64),
+    )
+    huge_action_result = huge_action.estimate(
+        np.zeros((1, 1)), keys=np.array([20], dtype=np.uint64)
+    )
+    assert huge_action_result.status is EstimateStatus.FAILED
+    assert huge_action_result.value is None
+    assert "action-support distance" in huge_action_result.diagnostics["gate_detail"]
+    json.dumps(huge_action_result.to_dict(), allow_nan=False)
