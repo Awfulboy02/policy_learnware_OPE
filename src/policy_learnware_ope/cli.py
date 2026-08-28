@@ -112,6 +112,32 @@ def _containing_git_root(path: Path) -> Path | None:
     for candidate in (current, *current.parents):
         if (candidate / ".git").exists():
             return candidate.resolve()
+        bare_markers = (
+            (candidate / "HEAD").is_file()
+            and (candidate / "objects").is_dir()
+            and (candidate / "refs").is_dir()
+            and (candidate / "config").is_file()
+        )
+        if bare_markers:
+            in_core = False
+            try:
+                for line in (candidate / "config").read_text(
+                    encoding="utf-8"
+                ).splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("["):
+                        in_core = stripped.casefold() == "[core]"
+                        continue
+                    key, separator, value = stripped.partition("=")
+                    if (
+                        in_core
+                        and separator
+                        and key.strip().casefold() == "bare"
+                        and value.strip().casefold() == "true"
+                    ):
+                        return candidate.resolve()
+            except OSError:
+                pass
     return None
 
 

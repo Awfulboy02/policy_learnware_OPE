@@ -301,6 +301,11 @@ def test_cli_outputs_are_no_clobber_and_never_enter_another_git_repo(
         run_toy(forbidden, seed=1, implementation_commit="f" * 40)
     assert not forbidden.exists()
 
+    bare_repo = tmp_path / "foreign-consumer.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare_repo)], check=True)
+    with pytest.raises(PermissionError, match="different Git repository"):
+        cli_module._guard_output_location(bare_repo / "artifacts" / "toy")
+
 
 def test_installed_layout_never_inherits_or_writes_foreign_git_identity(
     tmp_path: Path,
