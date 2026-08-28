@@ -119,25 +119,24 @@ def _containing_git_root(path: Path) -> Path | None:
             and (candidate / "config").is_file()
         )
         if bare_markers:
-            in_core = False
             try:
-                for line in (candidate / "config").read_text(
-                    encoding="utf-8"
-                ).splitlines():
-                    stripped = line.strip()
-                    if stripped.startswith("["):
-                        in_core = stripped.casefold() == "[core]"
-                        continue
-                    key, separator, value = stripped.partition("=")
-                    if (
-                        in_core
-                        and separator
-                        and key.strip().casefold() == "bare"
-                        and value.strip().casefold() == "true"
-                    ):
-                        return candidate.resolve()
+                bare = subprocess.run(
+                    [
+                        "git",
+                        f"--git-dir={candidate}",
+                        "config",
+                        "--bool",
+                        "--get",
+                        "core.bare",
+                    ],
+                    check=False,
+                    text=True,
+                    capture_output=True,
+                )
             except OSError:
-                pass
+                continue
+            if bare.returncode == 0 and bare.stdout.strip() == "true":
+                return candidate.resolve()
     return None
 
 

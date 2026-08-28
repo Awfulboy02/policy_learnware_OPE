@@ -303,6 +303,10 @@ def test_cli_outputs_are_no_clobber_and_never_enter_another_git_repo(
 
     bare_repo = tmp_path / "foreign-consumer.git"
     subprocess.run(["git", "init", "--bare", "-q", str(bare_repo)], check=True)
+    subprocess.run(
+        ["git", f"--git-dir={bare_repo}", "config", "core.bare", "yes"],
+        check=True,
+    )
     with pytest.raises(PermissionError, match="different Git repository"):
         cli_module._guard_output_location(bare_repo / "artifacts" / "toy")
 
