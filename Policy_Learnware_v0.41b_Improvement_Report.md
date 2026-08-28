@@ -2,7 +2,7 @@
 
 ## 1. 结论与验收边界
 
-v0.41b 已在 OPE companion 仓库的 `v041b` 分支完成一个诚实、可执行、可复现的 method-level synthetic MVP。算法代码基点为 commit `31c1648b68a89792a7a57d9bc14dc7630aa522e9`，由冻结的 `v04b@637e6650b5ae419919b9ea65137bdc896bbfd6be` 普通派生；本报告作为后续 release commit 的 tracked 文件进入同一分支。
+v0.41b 已在 OPE companion 仓库的 `v041b` 分支完成一个诚实、可执行、可复现的 method-level synthetic MVP。最初方法增强 commit 为 `31c1648b68a89792a7a57d9bc14dc7630aa522e9`，数值门禁与 candidate-key 纠偏后的干净代码/测试快照为 `79ce56f3c388aa289f3dc624cecf88f13b6d7921`，均由冻结的 `v04b@637e6650b5ae419919b9ea65137bdc896bbfd6be` 普通派生；本报告作为后续 release commit 的 tracked 文件进入同一分支。
 
 本轮完成两项方法增强：
 
@@ -24,7 +24,7 @@ v0.41b 已在 OPE companion 仓库的 `v041b` 分支完成一个诚实、可执�
 
 ## 3. 代码与依赖
 
-算法 commit 的 diff 为 10 个文件、`2186 insertions(+), 197 deletions(-)`：
+初始算法 commit 的 diff 为 10 个文件、`2186 insertions(+), 197 deletions(-)`；后续聚焦纠偏 commit 只修改 4 个既有模块和 4 个既有测试，`352 insertions(+), 71 deletions(-)`：
 
 - 唯一新增算法模块：`src/policy_learnware_ope/kmifqe.py`。
 - 唯一新增聚焦测试：`tests/test_kmifqe_protocol.py`。
@@ -51,19 +51,21 @@ v0.41b 已在 OPE companion 仓库的 `v041b` 分支完成一个诚实、可执�
 | Mahalanobis metric | 按 Hessian 正/负 eigenspace 构造 SPD metric，施加 eigen floor/regularization，并执行 `det(A)=1` normalization |
 | Eq. 11 bandwidth | 每轮从 TD-MSE bias²、variance、action dimension 与 active sample count 计算 `h*`；正式路径拒绝固定 median bandwidth |
 | kernel / mu ratio | 使用 local Mahalanobis Gaussian kernel 与 arbitrary-action exact behavior density，应用显式 ratio clipping；以 `p=w/sum(w)` 重采样 |
-| replacement resampling | seeded common-random uniforms 每轮按更新后的 p 重新映射为 replacement indices；记录 ESS、clip fraction、duplicate/unique fraction 和离散 index digest |
-| in-sample TD | bootstrap 使用同一被抽中日志行的 `next_behavior_action`，不使用 `pi(s')`；可物理核对的连续行必须满足 `next_behavior_action[i] == action[i+1]` |
+| replacement resampling | seeded common-random uniforms 每轮按更新后的 p 重新映射为 replacement indices；记录 ESS、clip fraction、duplicate/unique fraction 和离散 index digest；机制测试令 draw count 大于 active count，由鸽巢原理确定性证明 replacement duplicate |
+| in-sample TD | bootstrap 使用同一被抽中日志行的 `next_behavior_action`，不使用 `pi(s')`；连续行真实性按 `float64` 的 `atol=32*eps*max(1,max_abs_successor), rtol=32*eps` 核验并记录 max abs/max rel drift，所有 active row 均须由物理相邻行验证，否则 `NO_GO_MISSING_NEXT_BEHAVIOR_ACTION` |
 | mean-weight correction | critic 目标为 `mean(w) * MSE + ridge * ||theta||²`，因此相同 p、不同 `mean(w)` 会改变 regularized critic；测试已隔离证明 |
 | alternating loop | 每轮完整执行 Q/target-Q → Hessian/L → h → ratio/p → replacement resampling → logged-a' TD → target update，不再 H+1 后冻结 panel |
-| fail closed | exact-density、support/ESS、adjacency、finite state、target lag 和 convergence 任一不满足均不发布 value；陈旧 target 的错误 PASS 已有攻击型回归 |
+| fail closed | exact-density、support/ESS、adjacency authority、finite state/Q、target lag 和 convergence 任一不满足均不发布 value；陈旧 target 的错误 PASS 已有攻击型回归 |
+
+KMIFQE 不再继承 FQE 的 `1e-9` 默认收敛阈值：方法自身默认 Q-space relative tolerance 为 `0.003`，replacement probability L1 tolerance 为 `0.015`。Q gate 使用 `tolerance * (1 + max_abs_Q)` 的明确尺度；不可辨识 fixed-feature coefficient 的绝对 L2 不再作为跨后端失败门禁，finite Q/TD 与收敛不变量仍严格检查。
 
 二维 curved fixture 的机制证据：
 
-- 状态：`PASS`；67 次 iteration，67 次 Hessian 与 target update。
-- `h` 从 `10.0` 更新到 `0.4993939441`，轨迹 range 为 `9.5006060559`；测试逐轮从 bias²/variance 独立重算 Eq. 11。
-- local metric state variation `0.1957815792`，off-diagonal Frobenius mean `0.0460220331`，最大 determinant error `8.88e-16`。
-- replacement duplicates 63，unique fraction `0.5625`。
-- final Q update delta `0.0122586339 <= 0.0131184730`，p-L1 delta `0.0006351434 <= 0.003`。
+- 状态：`PASS`；68 次 iteration，68 次 Hessian 与 target update。
+- `h` 从 `10.0` 更新到 `0.4974388405`，轨迹 range 为 `9.5025611595`；测试逐轮从 bias²/variance 独立重算 Eq. 11。
+- local metric state variation `0.2051753335`，off-diagonal Frobenius mean `0.0473973262`，最大 determinant error `1.11e-15`。
+- active rows 144，replacement draw count 145，duplicates 63，unique fraction `0.5655172414`。
+- final Q update delta `0.0119668360 <= 0.0131476875`，p-L1 delta `0.0005638082 <= 0.015`。
 - 对称 `a'/-a'` 测试保持前两轮 h 与 resampled index digest 相同，同时第二轮 TD target 改变，隔离证明 logged adjacent action 真正进入 bootstrap。
 
 toy 的 action dimension 为 1；determinant normalization 在一维必然把 metric 归一为 1，所以 toy 的 metric state variation 约为 `1.22e-16`。非退化 local metric 的证据来自上述二维 fixture，不能把一维 toy 写成 metric-learning parity。
@@ -82,9 +84,11 @@ toy 的 action dimension 为 1；determinant normalization 在一维必然把 me
 机制测试确认：
 
 - train 与 final-panel chain 的位置和能量均发生变化，不依赖某个偶然精确 loss 常数。
-- 全部 24 个 RFF theta 维的解析 GP VJP 与 finite difference 一致；GP 超 margin 时非零，并实际改变 theta update。
+- 聚焦抽查前 3 个 RFF theta 维的解析 GP VJP 与 finite difference 一致；GP 超 margin 时非零，并实际改变 theta update。
 - tiny temperature 与极大 GP weight 两条路径均在发布模型前原子失败。
-- fixed seed 的 theta/value 使用 `float64` 预注册 `rtol=1e-9, atol=1e-10` 比较；离散身份与 seed/config digest 仍精确。
+- fixed seed 的 theta/value 在本地锁定 `float64` 测试中显式使用 `rtol/atol` 比较；离散身份与 seed/config digest 仍精确。本轮没有建立跨 backend golden 或 tolerance registry。
+
+ETM 推断 sampler 不在本轮训练机制验收范围内，且与论文/官方 release 均存在重要漂移：当前采用 conditional center + Gaussian initialization、noise `1`、clip `[-10,10]`、默认 20 步（toy 10 步）；论文 OPE 描述约 100 步/noise `0.1`，官方 release 又采用 zero initialization、默认零噪声并沿用 polynomial schedule/clips。该差异可能改变正式 OPE value，因此在正式 benchmark 前保持 `NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT`。当前计算计数也未覆盖 final diagnostic panel 与 inference 的全部 gradient evaluations，发表成本表前必须补齐；本轮不为此扩写 sampler。
 
 ## 6. 实际 toy 配置与结果
 
@@ -97,31 +101,34 @@ toy 的 action dimension 为 1；determinant normalization 在一维必然把 me
 
 两次独立 CLI 运行均为 `TOY_MVP_PASS`，并共同得到：
 
-- implementation commit `31c1648b68a89792a7a57d9bc14dc7630aa522e9`，tree `ed5948389316a4b5b70f96f20c2472edb168a6e9`，worktree `CLEAN`。
-- config SHA-256 `1de67b69da808af17b32c7466296f8d5add001a99f97696a7e6d3918ac252a98`。
-- reproducibility SHA-256 `4716083a04ca694411f2ab35f06ed103bf38eadbe13d0e1de8e42e405438d2fe`。
-- 六条 ranking seal 的 digest 与字节在同一锁定 NumPy/CPU backend、同 seed 双跑中一致；两个 `run.json` 因 seal 外 runtime 不同而分别为 `15eefbd0...` 与 `a5b2486b...`。
+- implementation commit `79ce56f3c388aa289f3dc624cecf88f13b6d7921`，tree `b01192c9a137424c40ca4f83e107c331cbff8434`，worktree `CLEAN`。
+- config SHA-256 `ff94a4f6389bb1c775ed5f6307c0ebab0fc4ce5fccab32aaad1d051e3ff45f08`；其中 candidate key 由 `SHA256(seed, method_id, candidate_id, phase)` 的前 64 bit 与 row index XOR 派生，不再依赖 candidate list position。
+- discrete reproducibility identity SHA-256 `fd45d519bd8f149f4ded269238552131f105ced90bfe7d318588a90c41d52b61`。该 digest 只绑定 implementation/config/dataset/candidate IDs/status/ranking/winner 等离散语义，不哈希浮点 estimates。
+- 两个 `run.json` 因 seal 外 runtime 不同而分别为 `d368b820...` 与 `9db0f29f...`；每次 ranking seal 仍由各自精确 digest 做单 artifact integrity 校验，但跨合法 backend 不要求浮点 payload 的 seal digest 相等。
 
 toy 排名结果如下；这是 synthetic fixture 结果，不是论文 benchmark：
 
 | 方法 | ranking | Hit@1 | 备注 |
 |---|---|---:|---|
 | FQE | 0,1,2,3,4 | 1 | value MAE `0.00722` |
-| KMIFQE | 2,3,0,1,4 | 0 | 五 candidate 均 PASS；value MAE `0.15352`，诚实保留失败的 top-1 决策 |
-| ETM | 0,1,3,2,4 | 1 | value MAE `0.02615` |
+| KMIFQE | 1,2,0,3,4 | 0 | 五 candidate 均 PASS；value MAE `0.17326`，诚实保留失败的 top-1 决策 |
+| ETM | 1,0,2,3,4 | 0 | value MAE `0.03877`；不把 synthetic top-1 失败隐藏为浮点噪声 |
 | DOPE-style MB-FF | 0,1,2,3,4 | 1 | project-defined reference |
 | AR-MBOPE | 0,1,2,3,4 | 1 | independent reference |
 | RAW_ADAPTER_FIXTURE | 3,2,4,1,0 | 0 | 仅 toy fixture；production Raw 仍 NO_GO |
 
-KMIFQE toy candidate 0：value `4.8402686934`，ESS fraction `0.59435`，clip fraction `0.34896`，unique resampled fraction `0.515625`，77 次完整 alternating updates。ETM toy candidate 0：40 optimizer updates，training chain mean energy `32.2566 → 3.3163`，final panel `31.6678 → 3.7691`，GP last `329.1056`，active rate `0.3591`。
+KMIFQE toy candidate 0：value `4.8106561999`，ESS fraction `0.66891`，clip fraction `0.10938`，unique resampled fraction `0.510417`，76 次完整 alternating updates。ETM toy candidate 0：value `5.0205986053`，40 optimizer updates，training chain mean energy `32.2173 → 3.2593`、逐链 mean absolute energy change `28.9580`，final panel `33.3759 → 3.8654`，GP last `442.0883`，active rate `0.3529`。
+
+候选池反序回归使用相同 seed 重新运行全部方法：按 candidate ID 对齐的 value 在显式 `rtol/atol` 内一致，所有 ranking 与 winner 精确不变。该测试直接覆盖了旧 `candidate_index*offset` 导致 KMIFQE winner 随候选顺序变化的语义错误。
 
 ## 7. 数值 gate 原则
 
 本轮没有引入 tolerance framework。规则集中在现有比较与聚焦测试中：
 
 - commit/tag、asset/config/protocol digest、candidate/context/membership/seed、shape/schema、权限与 seal expected digest 使用精确比较。
-- 浮点结果使用版本化、dtype-aware `atol/rtol`，并同时检查 finite、机制不变量、排序和最终决策；不以 derived-float hash 作为跨 backend 数值 gate。
-- 同一锁定 backend 的相同 seed seal 仍应字节稳定；合法 backend 改变时，浮点 payload 可在预注册容差内变化，新 artifact 仍各自绑定精确 digest。
+- 浮点结果使用测试中显式、dtype/尺度相称的 `atol/rtol`，并同时检查 finite、SPD/界限、机制调用计数、相对趋势、排序和最终决策；不以 derived-float hash 作为跨 backend 数值 gate。
+- 本轮没有跨 backend golden/tolerance registry。合法 backend 改变时，每次 artifact 仍绑定自己的精确 digest，但跨跑数值用显式容差比较，ranking/winner 作为决策语义精确比较。
+- adjacent action真实性同时要求全部 active row 有物理连续 authority；容差只吸收序列化末位漂移，max abs/max rel drift 与 tolerance 一并导出，实质错配仍 `INVALID_DATA`。
 - NaN/Inf、数量级异常、动作/状态语义错误、资产混用或排名改变不能被容差掩盖。
 
 ## 8. 测试与命令
@@ -130,23 +137,20 @@ KMIFQE toy candidate 0：value `4.8402686934`，ESS fraction `0.59435`，clip fr
 
 ```text
 .venv/bin/python -m pytest -q
-92 passed in 10.38s
+93 passed in 10.57s
 
-.venv/bin/python -m pytest tests/test_kmifqe_protocol.py tests/test_mbope.py -q
-14 passed in 0.74s
-
-.venv/bin/python -m pytest tests/test_fqe.py -q
-15 passed in 0.12s
+.venv/bin/python -m pytest tests/test_fqe.py tests/test_kmifqe_protocol.py tests/test_mbope.py tests/test_cli.py -q
+38 passed in 10.25s
 
 git diff --check
 PASS
 ```
 
-覆盖范围包括 finite-horizon known MDP、native t/H 与 termination/dataset-cut mask、exact density/support、stale-target/nonconvergence fail-closed、Eq. 11、local Hessian metric、replacement resampling、logged-a'、mean-weight correction、ETM conditional Langevin、GP VJP/真实参数影响、两次 fixed-seed toy、ranking/metrics export、CLI smoke 与 real-preflight。
+覆盖范围包括 finite-horizon known MDP、native t/H 与 termination/dataset-cut mask、exact density/support、adjacency roundoff/authority、stale-target/nonconvergence/nonfinite-Q fail-closed、Eq. 11、local Hessian metric、replacement resampling、logged-a'、mean-weight Q-space effect、ETM conditional Langevin、GP VJP/真实参数影响、candidate permutation invariance、两次 fixed-seed toy、ranking/metrics export、CLI smoke 与 real-preflight。
 
 ## 9. Production fail-closed preflight
 
-`real-preflight` artifact SHA-256 为 `0bde69dbde42cadb5d034086616597af880305d26f2e042d5021bb0c1bb0a871`，config SHA-256 为 `00f00677f7d9e4fe64ba572501037e20b33fe05db337badc3511c6ca42a3e2e5`。状态为 `NO_GO`，且：
+`real-preflight` artifact SHA-256 为 `d68b32c8e63cc5deadf59a80f7570af6f6b66270d2b6f47565ac117d47e6379c`，config SHA-256 为 `00f00677f7d9e4fe64ba572501037e20b33fe05db337badc3511c6ca42a3e2e5`。状态为 `NO_GO`，且：
 
 - `production_training_started=false`
 - `asset_mutation_started=false`
@@ -186,9 +190,13 @@ OPE 仓受保护引用在算法提交前后保持：
 
 - KMIFQE 使用 fixed seeded tanh basis + damped analytic regularized output fit，而非官方 fully-trained 2×256 PyTorch critic/Adam。
 - KMIFQE 使用每轮 remap 的 common-random replacement uniforms，而非每轮 fresh multinomial minibatch。
+- KMIFQE 使用 project overall scalar ratio clip `[1e-3,2]`，未复刻官方更宽及逐维 clipping 语义；这是重要科学漂移，不得用 toy PASS 淡化。
 - KMIFQE 使用项目 finite-H native-time mask 与 raw `J_gamma,H`，不是官方 normalized continuing convention。
+- KMIFQE 当前 materialize `N×d×d` Hessian、metric 与 transform；在 `N=10^6,d=17` 量级峰值可能超过 13 GB。未在无证据下仓促加入 chunk framework，正式 OPS-DS 前状态为 `NO_GO_OPS_DS_DENSE_HESSIAN_PANEL`。
 - ETM 使用 RFF energy + ridge center，而非官方 4×200 ReLU MLP。
 - ETM training chain选择官方 release 的 polynomial schedule；该 release 与论文 Eq. 23/Table 2 在 drift/step 表述上存在差异。
+- ETM inference 的 initialization/noise/clip/step count 同论文与官方 release 都未对齐，正式 value benchmark 前为 `NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT`；当前成本计数也未包含 final diagnostic/inference 的全部 gradient evaluations。
+- synthetic linear fixture 不验证论文 discontinuity/OOD 场景，也不继承 DOPE claim。
 - 没有 MuJoCo/D4RL 或论文 benchmark numerical parity claim。
 
 真实实验延期原因不变：旧 clipped-Gaussian 日志无 arbitrary-action exact density；旧 oracle 无 per-step reward，不能构造锁定的 `J_0.99,H1000`；现有 FPO actor 尚无可验证 deterministic authority；Raw-Delta/RKME operator 尚未形成 digest-locked production adapter response。
