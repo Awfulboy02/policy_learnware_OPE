@@ -134,7 +134,9 @@ def _containing_git_root(path: Path) -> Path | None:
                     capture_output=True,
                 )
             except OSError:
-                continue
+                return candidate.resolve()
+            if bare.returncode != 0:
+                return candidate.resolve()
             if bare.returncode == 0 and bare.stdout.strip() == "true":
                 return candidate.resolve()
     return None
