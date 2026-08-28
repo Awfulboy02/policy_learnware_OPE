@@ -100,13 +100,14 @@ def _curved_batch(*, episodes: int = 48, horizon: int = 4) -> TransitionBatch:
 
 
 def _fit(batch: TransitionBatch) -> FiniteHorizonKMIFQE:
+    active_rows = int(np.sum(batch.bootstrap_mask(4)))
     return FiniteHorizonKMIFQE(
         gamma=0.99,
         horizon=4,
         ridge=2e-5,
         max_iterations=200,
-        tolerance=3e-3,
         critic_features=28,
+        resample_size=active_rows + 1,
         min_ess_fraction=0.005,
         target_update_interval=1,
         critic_step_size=0.1,
@@ -120,12 +121,15 @@ def _fit(batch: TransitionBatch) -> FiniteHorizonKMIFQE:
 
 def test_b20_mechanisms_are_executed_and_seeded_reproducibly() -> None:
     batch = _curved_batch()
-    first = _fit(batch).estimate(
-        batch.observation[::37], keys=np.arange(len(batch.observation[::37]), dtype=np.uint64)
+    first_estimator = _fit(batch)
+    second_estimator = _fit(batch)
+    probe = batch.observation[::37]
+    probe_times = batch.native_timestep[::37]
+    probe_keys = np.arange(len(probe), dtype=np.uint64)
+    first = first_estimator.estimate(
+        probe, keys=probe_keys
     )
-    second = _fit(batch).estimate(
-        batch.observation[::37], keys=np.arange(len(batch.observation[::37]), dtype=np.uint64)
-    )
+    second = second_estimator.estimate(probe, keys=probe_keys)
 
     assert first.status is EstimateStatus.PASS
     assert np.isfinite(first.value)
@@ -137,6 +141,8 @@ def test_b20_mechanisms_are_executed_and_seeded_reproducibly() -> None:
 
     diagnostics = first.diagnostics
     assert diagnostics["bandwidth_source"] == "B20_EQ11_TD_MSE_BIAS_VARIANCE_ESTIMATOR"
+    assert diagnostics["requested_tolerance"] == pytest.approx(3e-3)
+    assert diagnostics["probability_l1_tolerance"] == pytest.approx(1.5e-2)
     assert diagnostics["bandwidth_update_count"] >= 2
     assert np.ptp(diagnostics["bandwidth_history"]) > 1e-6
     assert diagnostics["alternating_update_count"] == diagnostics["iterations"]
@@ -148,6 +154,7 @@ def test_b20_mechanisms_are_executed_and_seeded_reproducibly() -> None:
     assert diagnostics["metric_determinant_max_error"] < 1e-8
     assert np.isfinite(diagnostics["hessian_abs_condition_p95"])
     assert diagnostics["replacement_resampling"] is True
+    assert diagnostics["replacement_draw_count"] == first.support["active_rows"] + 1
     assert diagnostics["replacement_duplicate_count"] > 0
     assert diagnostics["unique_resampled_fraction"] < 1.0
     assert diagnostics["bootstrap_action_source"] == "logged_adjacent_next_behavior_action"
@@ -162,8 +169,28 @@ def test_b20_mechanisms_are_executed_and_seeded_reproducibly() -> None:
         rtol=1e-9,
         atol=1e-10,
     )
-    assert diagnostics["target_critic_parameter_l2"] == pytest.approx(
-        second.diagnostics["target_critic_parameter_l2"], rel=1e-9, abs=1e-10
+    assert first_estimator._trainer is not None
+    assert second_estimator._trainer is not None
+    assert first_estimator._trainer.feature_map is not None
+    assert second_estimator._trainer.feature_map is not None
+    assert first_estimator._trainer.target_coefficient is not None
+    assert second_estimator._trainer.target_coefficient is not None
+    probe_action = CurvedActor().sample_actions(
+        probe,
+        probe_times,
+        keys=probe_keys,
+    )
+    first_probe_feature = first_estimator._trainer.feature_map.transform(
+        probe, probe_action, probe_times / 4.0
+    )
+    second_probe_feature = second_estimator._trainer.feature_map.transform(
+        probe, probe_action, probe_times / 4.0
+    )
+    np.testing.assert_allclose(
+        first_probe_feature @ first_estimator._trainer.target_coefficient,
+        second_probe_feature @ second_estimator._trainer.target_coefficient,
+        rtol=1e-8,
+        atol=1e-10,
     )
     assert diagnostics["prediction_delta_history"][-1] <= diagnostics["final_q_tolerance"]
     assert diagnostics["target_lag_history"][-1] <= diagnostics["final_q_tolerance"]
@@ -291,4 +318,18 @@ def test_mean_weight_bias_correction_changes_regularized_critic_not_sampling() -
         2.0 * baseline.diagnostics["mean_weight_history"][0]
     )
     assert baseline.coefficient is not None and doubled.coefficient is not None
-    assert not np.allclose(baseline.coefficient, doubled.coefficient, rtol=1e-9, atol=1e-12)
+    assert baseline.feature_map is not None and doubled.feature_map is not None
+    baseline_feature = baseline.feature_map.transform(
+        batch.observation,
+        batch.action,
+        batch.native_timestep / 4.0,
+    )
+    doubled_feature = doubled.feature_map.transform(
+        batch.observation,
+        batch.action,
+        batch.native_timestep / 4.0,
+    )
+    baseline_q = baseline_feature @ baseline.coefficient
+    doubled_q = doubled_feature @ doubled.coefficient
+    q_scale = max(1.0, float(np.max(np.abs(baseline_q))))
+    assert float(np.max(np.abs(baseline_q - doubled_q))) > 1e-4 * q_scale

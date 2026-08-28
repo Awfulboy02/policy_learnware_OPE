@@ -657,6 +657,9 @@ class _ContrastiveEnergyModel:
         trace = {
             "start_energy_mean": float(np.mean(initial_energy)),
             "end_energy_mean": float(np.mean(final_energy)),
+            "mean_absolute_energy_change": float(
+                np.mean(np.abs(final_energy - initial_energy))
+            ),
             "mean_displacement": float(
                 np.mean(np.linalg.norm(negative - initial, axis=-1))
             ),
@@ -702,6 +705,7 @@ class _ContrastiveEnergyModel:
         condition_rows = 0
         chain_start_energy: list[float] = []
         chain_end_energy: list[float] = []
+        chain_absolute_energy_change: list[float] = []
         chain_displacement: list[float] = []
         grad_norm_means: list[float] = []
         grad_norm_maxes: list[float] = []
@@ -782,6 +786,9 @@ class _ContrastiveEnergyModel:
                 condition_rows += len(rows)
                 chain_start_energy.append(latest_trace["start_energy_mean"])
                 chain_end_energy.append(latest_trace["end_energy_mean"])
+                chain_absolute_energy_change.append(
+                    latest_trace["mean_absolute_energy_change"]
+                )
                 chain_displacement.append(latest_trace["mean_displacement"])
                 grad_norm_means.append(gp_summary["gradient_norm_mean"])
                 grad_norm_maxes.append(gp_summary["gradient_norm_max"])
@@ -830,9 +837,15 @@ class _ContrastiveEnergyModel:
             "training_sample_clip": self.training_sample_clip,
             "training_chain_start_energy_mean": float(np.mean(chain_start_energy)),
             "training_chain_end_energy_mean": float(np.mean(chain_end_energy)),
+            "training_chain_mean_absolute_energy_change": float(
+                np.mean(chain_absolute_energy_change)
+            ),
             "training_chain_mean_displacement": float(np.mean(chain_displacement)),
             "final_panel_chain_start_energy": panel_trace["start_energy_mean"],
             "final_panel_chain_end_energy": panel_trace["end_energy_mean"],
+            "final_panel_chain_mean_absolute_energy_change": panel_trace[
+                "mean_absolute_energy_change"
+            ],
             "final_panel_chain_mean_displacement": panel_trace["mean_displacement"],
             "langevin_negative_chain_count": condition_rows * self.negatives,
             "langevin_negative_step_count": condition_rows

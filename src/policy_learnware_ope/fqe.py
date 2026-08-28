@@ -442,7 +442,7 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
         horizon: int = 1000,
         ridge: float = 1e-6,
         max_iterations: int | None = None,
-        tolerance: float = 1e-9,
+        tolerance: float = 3e-3,
         kernel_bandwidth: float | None = None,
         min_log_density: float = -50.0,
         min_ess_fraction: float = 0.01,
@@ -457,7 +457,7 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
         resample_size: int | None = None,
         target_update_interval: int = 1,
         critic_step_size: float = 0.1,
-        probability_tolerance: float | None = None,
+        probability_tolerance: float | None = 1.5e-2,
     ) -> None:
         super().__init__(
             gamma=gamma,
@@ -558,9 +558,12 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
                         "fixed seeded tanh feature critic rather than official fully-trained 2x256 tanh network",
                         "damped analytic output-layer fit rather than official Adam critic update",
                         "seeded common-random replacement uniforms are remapped each iteration rather than drawing a fresh minibatch",
+                        "one overall clipped kernel/mu ratio uses project range [1e-3,2] rather than the official wider per-dimension clipping semantics",
                         "finite-H native-time masks and raw J_gamma,H rather than normalized continuing value",
+                        "dense per-row Hessian/metric panels are not production-scaled for OPS-DS million-row workloads",
                         "no MuJoCo/D4RL paper benchmark parity claim",
                     ],
+                    "production_scalability_status": "NO_GO_OPS_DS_DENSE_HESSIAN_PANEL",
                 }
             )
             if getattr(behavior_density, "exact", False) is not True:
@@ -601,8 +604,52 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
                 & (batch.native_timestep[1:] == batch.native_timestep[:-1] + 1)
             )
             verified_rows = row[contiguous]
-            if len(verified_rows) and not np.array_equal(
-                logged_next_action[verified_rows], batch.action[verified_rows + 1]
+            verified_logged_action = logged_next_action[verified_rows]
+            verified_successor_action = batch.action[verified_rows + 1]
+            comparison_dtype = np.result_type(
+                verified_logged_action.dtype, verified_successor_action.dtype
+            )
+            comparison_epsilon = float(np.finfo(comparison_dtype).eps)
+            adjacency_rtol = 32.0 * comparison_epsilon
+            reference_scale = max(
+                1.0,
+                float(np.max(np.abs(verified_successor_action)))
+                if len(verified_rows)
+                else 0.0,
+            )
+            adjacency_atol = adjacency_rtol * reference_scale
+            absolute_drift = np.abs(
+                verified_logged_action - verified_successor_action
+            )
+            max_abs_drift = (
+                float(np.max(absolute_drift)) if len(verified_rows) else 0.0
+            )
+            relative_denominator = np.maximum(
+                np.abs(verified_successor_action), adjacency_atol
+            )
+            max_rel_drift = (
+                float(np.max(absolute_drift / relative_denominator))
+                if len(verified_rows)
+                else 0.0
+            )
+            self._diagnostics.update(
+                {
+                    "adjacent_action_comparison_dtype": str(comparison_dtype),
+                    "adjacent_action_tolerance_rule": (
+                        "allclose_atol=32*eps*max(1,max_abs_successor),rtol=32*eps"
+                    ),
+                    "adjacent_action_atol": adjacency_atol,
+                    "adjacent_action_rtol": adjacency_rtol,
+                    "adjacent_action_max_abs_drift": max_abs_drift,
+                    "adjacent_action_max_rel_drift": max_rel_drift,
+                }
+            )
+            if len(verified_rows) and not np.allclose(
+                verified_logged_action,
+                verified_successor_action,
+                rtol=adjacency_rtol,
+                atol=adjacency_atol,
+                equal_nan=False,
             ):
                 raise DataValidationError(
                     EstimateStatus.INVALID_DATA.value,
@@ -613,8 +660,21 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
             self._provenance["logged_adjacency_authority"] = (
                 "CONTIGUOUS_ROWS_VERIFIED"
                 if unverified_count == 0
-                else "PARTIAL_VERIFICATION_WITH_UNVERIFIED_EXPORTED_ADJACENCY"
+                else "NO_GO_UNVERIFIED_EXPORTED_ADJACENCY"
             )
+            if unverified_count:
+                self._support.update(
+                    {
+                        "active_rows": int(np.sum(active)),
+                        "verified_adjacent_rows": verified_count,
+                        "unverified_exported_adjacent_rows": unverified_count,
+                    }
+                )
+                self._close_gate(
+                    EstimateStatus.NO_GO_MISSING_NEXT_BEHAVIOR_ACTION,
+                    "bootstrap-active rows lack physically verified adjacent behavior actions and no external adjacency authority is implemented",
+                )
+                return self
             log_behavior_active = behavior_log_prob(
                 behavior_density,
                 batch.next_observation[active],

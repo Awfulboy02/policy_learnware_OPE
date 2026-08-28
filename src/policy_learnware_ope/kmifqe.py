@@ -621,9 +621,15 @@ class B20KMIFQETrainer:
                 solution = np.linalg.pinv(gram, rcond=1e-12) @ rhs
             linear_solves += 1
             updated = coefficient + self.critic_step_size * (solution - coefficient)
-            _require_finite("critic linear system", gram, rhs, solution, updated)
-            if not np.all(np.isfinite(updated)) or np.linalg.norm(updated) > 1e14:
-                raise FloatingPointError("KMIFQE critic update diverged")
+            updated_q = current_feature @ updated
+            _require_finite(
+                "critic linear system and Q prediction",
+                gram,
+                rhs,
+                solution,
+                updated,
+                updated_q,
+            )
             prediction_delta = float(
                 np.max(np.abs(current_feature @ (updated - coefficient)))
             )

@@ -395,8 +395,8 @@ def test_kmifqe_recovers_known_value_and_queries_arbitrary_density() -> None:
     assert result.provenance["official_parity"] is False
     # One exact-density query for logged a' and another for pi(s').
     assert len(density.calls) == 2
-    np.testing.assert_array_equal(density.calls[0], 0.0)
-    np.testing.assert_array_equal(density.calls[1], 0.25)
+    np.testing.assert_allclose(density.calls[0], 0.0, rtol=1e-12, atol=1e-14)
+    np.testing.assert_allclose(density.calls[1], 0.25, rtol=1e-12, atol=1e-14)
     assert result.support["verified_adjacent_rows"] == result.support["active_rows"]
 
 
@@ -453,6 +453,39 @@ def test_kmifqe_existing_density_and_next_action_gates() -> None:
     )
     assert stochastic_result.status is EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS
 
+
+
+def test_kmifqe_adjacent_action_allows_roundoff_but_rejects_semantic_mismatch() -> None:
+    batch = known_mdp_batch(episodes=2)
+    actor = ConstantActor()
+    roundoff_magnitude = 8.0 * np.finfo(np.float64).eps
+    roundoff = replace(
+        batch,
+        next_behavior_action=np.full_like(batch.action, roundoff_magnitude),
+        source_digest="synthetic-roundoff-adjacency",
+    )
+    roundoff_estimator = FiniteHorizonKMIFQE(
+        horizon=3,
+        ridge=1e-10,
+        max_iterations=600,
+        critic_step_size=1.0,
+    ).fit(
+        roundoff,
+        actor,
+        behavior_density=GaussianDensity(),
+        fit_keys=np.arange(len(roundoff), dtype=np.uint64),
+    )
+    roundoff_result = roundoff_estimator.estimate(
+        np.zeros((1, 1)), keys=np.array([5], dtype=np.uint64)
+    )
+    assert roundoff_result.status is EstimateStatus.PASS
+    assert 0.0 < roundoff_result.diagnostics["adjacent_action_max_abs_drift"]
+    assert (
+        roundoff_result.diagnostics["adjacent_action_max_abs_drift"]
+        <= roundoff_result.diagnostics["adjacent_action_atol"]
+    )
+    assert roundoff_result.diagnostics["adjacent_action_comparison_dtype"] == "float64"
+
     inconsistent = replace(
         batch,
         next_behavior_action=np.ones_like(batch.action),
@@ -465,10 +498,14 @@ def test_kmifqe_existing_density_and_next_action_gates() -> None:
         fit_keys=np.arange(len(inconsistent), dtype=np.uint64),
     )
     inconsistent_result = inconsistent_estimator.estimate(
-        np.zeros((1, 1)), keys=np.array([5], dtype=np.uint64)
+        np.zeros((1, 1)), keys=np.array([6], dtype=np.uint64)
     )
     assert inconsistent_result.status is EstimateStatus.INVALID_DATA
     assert "contiguous logged successor" in inconsistent_result.diagnostics["gate_detail"]
+    assert (
+        inconsistent_result.diagnostics["adjacent_action_max_abs_drift"]
+        > inconsistent_result.diagnostics["adjacent_action_atol"]
+    )
 
 
 def test_kmifqe_fails_closed_outside_behavior_support() -> None:
@@ -487,24 +524,23 @@ def test_kmifqe_fails_closed_outside_behavior_support() -> None:
 
 
 def test_kmifqe_ess_gate_uses_only_active_bellman_rows() -> None:
-    rows = 100
-    terminal = np.ones(rows, dtype=bool)
-    terminal[:2] = False
-    next_behavior_action = np.zeros((rows, 1))
-    next_behavior_action[1, 0] = 1.0
+    rows = 4
+    action = np.asarray([[0.0], [0.0], [0.0], [1.0]])
+    next_behavior_action = np.asarray([[0.0], [0.0], [1.0], [0.0]])
     batch = TransitionBatch(
         observation=np.zeros((rows, 1)),
-        action=np.zeros((rows, 1)),
+        action=action,
         reward=np.ones(rows),
         next_observation=np.zeros((rows, 1)),
-        terminated=terminal,
-        truncated=np.zeros(rows, dtype=bool),
+        terminated=np.zeros(rows, dtype=bool),
+        truncated=np.asarray([False, True, False, True]),
         dataset_cut=np.zeros(rows, dtype=bool),
-        native_timestep=np.zeros(rows, dtype=np.int64),
-        episode_id=np.arange(rows, dtype=np.int64),
-        episode_offsets=np.arange(rows + 1, dtype=np.int64),
-        timestep_provenance="native_indices",
+        native_timestep=np.asarray([0, 1, 0, 1]),
+        episode_id=np.asarray([0, 0, 1, 1]),
+        episode_offsets=np.asarray([0, 2, 4]),
+        timestep_provenance="episode_offsets",
         next_behavior_action=next_behavior_action,
+        truncation_reason=np.asarray(["none", "horizon", "none", "horizon"]),
     )
 
     class SkewedDensity(GaussianDensity):

@@ -72,6 +72,33 @@ def _payload_digest(payload: Any) -> str:
     return sha256(_canonical_bytes(payload)).hexdigest()
 
 
+def _candidate_keys(
+    *,
+    seed: int,
+    method_id: str,
+    candidate_id: str,
+    phase: str,
+    rows: int,
+) -> np.ndarray:
+    """Derive row keys from stable identities, never candidate list position."""
+
+    root = int.from_bytes(
+        sha256(
+            _canonical_bytes(
+                {
+                    "schema": "policy-learnware.candidate-key.v1",
+                    "seed": seed,
+                    "method_id": method_id,
+                    "candidate_id": candidate_id,
+                    "phase": phase,
+                }
+            )
+        ).digest()[:8],
+        "big",
+    )
+    return np.arange(rows, dtype=np.uint64) ^ np.uint64(root)
+
+
 def _write_canonical_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as handle:
@@ -278,14 +305,22 @@ def _toy_initial_states() -> np.ndarray:
     return np.asarray([[-1.0], [-0.65], [-0.25], [0.0], [0.3], [0.7], [1.1]], dtype=float)
 
 
-def _toy_oracle(candidates: Sequence[_ToyActor], initial_states: np.ndarray) -> dict[str, float]:
+def _toy_oracle(
+    candidates: Sequence[_ToyActor], initial_states: np.ndarray, *, seed: int
+) -> dict[str, float]:
     result: dict[str, float] = {}
-    for candidate_index, candidate in enumerate(candidates):
+    for candidate in candidates:
         totals = np.zeros(len(initial_states), dtype=float)
         state = initial_states.copy()
         discount = 1.0
         for native_t in range(TOY_HORIZON):
-            keys = np.arange(len(state), dtype=np.uint64) + candidate_index * 1000 + native_t * 100
+            keys = _candidate_keys(
+                seed=seed,
+                method_id="TOY_ORACLE_AFTER_SEAL",
+                candidate_id=candidate.policy_id,
+                phase=f"timestep-{native_t}",
+                rows=len(state),
+            )
             action = candidate.sample_actions(
                 state,
                 np.full(len(state), native_t, dtype=np.int64),
@@ -468,6 +503,9 @@ def run_toy(
         "horizon": TOY_HORIZON,
         "episodes": 48,
         "candidate_count": 5,
+        "candidate_key_derivation": (
+            "sha256(seed,method_id,candidate_id,phase)[0:8]_xor_row_index"
+        ),
         "fqe": {
             "ridge": 1e-7,
             "max_iterations": 2500,
@@ -507,7 +545,7 @@ def run_toy(
         method_started = perf_counter()
         method_estimates: dict[str, ValueEstimate] = {}
         actual_method_id: str | None = None
-        for candidate_index, candidate in enumerate(candidates):
+        for candidate in candidates:
             estimator_config = (
                 config["kmifqe"]
                 if estimator_type is FiniteHorizonKMIFQE
@@ -522,19 +560,32 @@ def run_toy(
                 actual_method_id = estimator.method_id
             elif estimator.method_id != actual_method_id:
                 raise RuntimeError("one estimator family produced inconsistent method IDs")
-            fit_keys = np.arange(len(batch), dtype=np.uint64) + candidate_index * 10_000
+            fit_keys = _candidate_keys(
+                seed=seed,
+                method_id=estimator.method_id,
+                candidate_id=candidate.policy_id,
+                phase="fit",
+                rows=len(batch),
+            )
             if estimator_type is FiniteHorizonKMIFQE:
                 estimator.fit(batch, candidate, behavior_density=density, fit_keys=fit_keys)
             else:
                 estimator.fit(batch, candidate, fit_keys=fit_keys)
-            estimate_keys = np.arange(len(initial), dtype=np.uint64) + candidate_index * 100_000
+            estimate_keys = _candidate_keys(
+                seed=seed,
+                method_id=estimator.method_id,
+                candidate_id=candidate.policy_id,
+                phase="estimate",
+                rows=len(initial),
+            )
             method_estimates[candidate.policy_id] = estimator.estimate(initial, keys=estimate_keys)
         if actual_method_id is None:
             raise RuntimeError("toy fixture has no candidates")
         estimates[actual_method_id] = method_estimates
         runtime_by_method[actual_method_id] = perf_counter() - method_started
 
-    for method_index, (selector_id, _family, model_kwargs) in enumerate(model_specs):
+    model_fit_actor = min(candidates, key=lambda candidate: candidate.policy_id)
+    for selector_id, _family, model_kwargs in model_specs:
         method_started = perf_counter()
         estimator = make_model_based_estimator(
             selector_id,
@@ -543,14 +594,27 @@ def run_toy(
             rollouts_per_initial=model_common["rollouts_per_initial"],
             ridge=model_common["ridge"],
             **model_kwargs,
-        ).fit(
+        )
+        estimator.fit(
             batch,
-            candidates[0],
-            fit_keys=np.asarray([seed + 100 + method_index], dtype=np.uint64),
+            model_fit_actor,
+            fit_keys=_candidate_keys(
+                seed=seed,
+                method_id=estimator.method_id,
+                candidate_id="__transition_model_fit__",
+                phase="fit",
+                rows=1,
+            ),
         )
         method_estimates = {}
-        for candidate_index, candidate in enumerate(candidates):
-            estimate_keys = np.arange(len(initial), dtype=np.uint64) + candidate_index * 100_000
+        for candidate in candidates:
+            estimate_keys = _candidate_keys(
+                seed=seed,
+                method_id=estimator.method_id,
+                candidate_id=candidate.policy_id,
+                phase="estimate",
+                rows=len(initial),
+            )
             method_estimates[candidate.policy_id] = estimator.estimate(
                 initial,
                 keys=estimate_keys,
@@ -630,6 +694,7 @@ def run_toy(
     runtime_by_method[RAW_FIXTURE_METHOD_ID] = perf_counter() - raw_started
 
     seals: dict[str, dict[str, str]] = {}
+    ranking_semantics: dict[str, dict[str, Any]] = {}
     raw_seal = seal_ranking(
         destination / "seals" / f"{RAW_FIXTURE_METHOD_ID}.json",
         method_id=RAW_FIXTURE_METHOD_ID,
@@ -655,6 +720,14 @@ def run_toy(
     seals[RAW_FIXTURE_METHOD_ID] = {
         "path": f"seals/{RAW_FIXTURE_METHOD_ID}.json",
         "sha256": raw_seal.digest,
+    }
+    ranking_semantics[RAW_FIXTURE_METHOD_ID] = {
+        "candidate_set_digest": raw_seal.payload["candidate_set_digest"],
+        "ranking": list(raw_seal.payload["ranking"]),
+        "selected_candidate_id": raw_seal.payload["selected_candidate_id"],
+        "statuses": {
+            row["candidate_id"]: row["status"] for row in raw_seal.payload["rows"]
+        },
     }
 
     for method_id, method_estimates in estimates.items():
@@ -694,10 +767,18 @@ def run_toy(
             "path": f"seals/{method_id}.json",
             "sha256": seal.digest,
         }
+        ranking_semantics[method_id] = {
+            "candidate_set_digest": seal.payload["candidate_set_digest"],
+            "ranking": list(seal.payload["ranking"]),
+            "selected_candidate_id": seal.payload["selected_candidate_id"],
+            "statuses": {
+                row["candidate_id"]: row["status"] for row in seal.payload["rows"]
+            },
+        }
 
     # Synthetic oracle evaluation is deliberately invoked only after every
     # method score and ranking has been sealed.
-    oracle_values = _toy_oracle(candidates, initial)
+    oracle_values = _toy_oracle(candidates, initial, seed=seed)
     oracle_manifest = {
         "schema": ORACLE_MANIFEST_SCHEMA,
         "context_id": TOY_CONTEXT,
@@ -738,13 +819,13 @@ def run_toy(
         for method_id, method_estimates in estimates.items()
     }
     reproducibility_payload = {
+        "schema": "policy-learnware.reproducibility-identity.v2",
         "seed": seed,
         "config_sha256": config_digest,
-        "estimates": stable_estimates,
-        "raw_scores": raw_scores,
-        "ranking_seal_sha256": {
-            method_id: seal_ref["sha256"] for method_id, seal_ref in sorted(seals.items())
-        },
+        "implementation": implementation,
+        "dataset_digest": batch.source_digest,
+        "candidate_ids": candidate_ids,
+        "ranking_semantics": ranking_semantics,
     }
     method_scope = _toy_method_scope(sorted(estimates))
     for method_id, method_estimates in estimates.items():

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import policy_learnware_ope.cli as cli_module
 from policy_learnware_ope.adapters import RAW_QUERY_SCHEMA
 from policy_learnware_ope.benchmark import load_ranking_seal
 from policy_learnware_ope.cli import _raw_membership_digest, _toy_batch, main, run_toy
@@ -77,22 +78,55 @@ def test_toy_runner_fits_all_methods_seals_then_exports_metrics(tmp_path: Path):
     assert str(tmp_path) not in run_text
 
 
-def test_same_seed_has_stable_semantics_and_byte_identical_seals(tmp_path: Path):
+def test_same_seed_is_candidate_order_invariant_without_float_hash_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     first_output = tmp_path / "first"
     second_output = tmp_path / "second"
+    candidates = cli_module._toy_candidates()
     first = run_toy(first_output, seed=23, implementation_commit="d" * 40)
+    monkeypatch.setattr(
+        cli_module,
+        "_toy_candidates",
+        lambda: list(reversed(candidates)),
+    )
     second = run_toy(second_output, seed=23, implementation_commit="d" * 40)
 
+    # This digest binds only discrete identity/status/ranking semantics.  Float
+    # values are compared below with the declared local float64 tolerance.
     assert first["reproducibility_sha256"] == second["reproducibility_sha256"]
-    assert first["estimates"] == second["estimates"]
-    assert first["raw_scores"] == second["raw_scores"]
+    for method_id, first_rows in first["estimates"].items():
+        second_rows = second["estimates"][method_id]
+        assert set(first_rows) == set(second_rows)
+        for candidate_id, first_row in first_rows.items():
+            second_row = second_rows[candidate_id]
+            assert first_row["method_id"] == second_row["method_id"]
+            assert first_row["status"] == second_row["status"]
+            assert first_row["value"] == pytest.approx(
+                second_row["value"], rel=1e-8, abs=1e-10
+            )
+    for candidate_id, first_score in first["raw_scores"].items():
+        assert first_score == pytest.approx(
+            second["raw_scores"][candidate_id], rel=1e-12, abs=1e-14
+        )
     for method_id in EXPECTED_METHODS:
         first_ref = first["ranking_seals"][method_id]
         second_ref = second["ranking_seals"][method_id]
-        assert first_ref["sha256"] == second_ref["sha256"]
-        assert (first_output / first_ref["path"]).read_bytes() == (
-            second_output / second_ref["path"]
-        ).read_bytes()
+        first_seal = load_ranking_seal(
+            first_output / first_ref["path"],
+            expected_seal_digest=first_ref["sha256"],
+        )
+        second_seal = load_ranking_seal(
+            second_output / second_ref["path"],
+            expected_seal_digest=second_ref["sha256"],
+        )
+        assert first_seal.payload["candidate_set_digest"] == second_seal.payload[
+            "candidate_set_digest"
+        ]
+        assert first_seal.payload["ranking"] == second_seal.payload["ranking"]
+        assert first_seal.payload["selected_candidate_id"] == second_seal.payload[
+            "selected_candidate_id"
+        ]
 
 
 def test_raw_membership_binds_reward_free_physical_rows() -> None:
