@@ -809,6 +809,13 @@ class _ContrastiveEnergyModel:
         final_loss, _ = self._nce_loss(energy)
         energy_gap = float(np.mean(energy[:, 1:]) - np.mean(energy[:, 0]))
         self._require_finite("final contrastive panel", energy, final_loss, energy_gap)
+        training_langevin_gradient_evaluations = (
+            condition_rows * self.negatives * self.training_langevin_steps
+        )
+        final_panel_langevin_chains = len(panel_rows) * self.negatives
+        final_panel_langevin_gradient_evaluations = (
+            final_panel_langevin_chains * self.training_langevin_steps
+        )
         self.diagnostics = {
             "conditional_energy": "quadratic_base_plus_learned_joint_RFF_energy",
             "contrastive_objective": "InfoNCE_with_conditional_Langevin_negatives",
@@ -848,9 +855,18 @@ class _ContrastiveEnergyModel:
             ],
             "final_panel_chain_mean_displacement": panel_trace["mean_displacement"],
             "langevin_negative_chain_count": condition_rows * self.negatives,
-            "langevin_negative_step_count": condition_rows
-            * self.negatives
-            * self.training_langevin_steps,
+            "langevin_negative_step_count": training_langevin_gradient_evaluations,
+            "training_langevin_gradient_evaluation_count": (
+                training_langevin_gradient_evaluations
+            ),
+            "final_panel_langevin_chain_count": final_panel_langevin_chains,
+            "final_panel_langevin_gradient_evaluation_count": (
+                final_panel_langevin_gradient_evaluations
+            ),
+            "fit_langevin_gradient_evaluation_count": (
+                training_langevin_gradient_evaluations
+                + final_panel_langevin_gradient_evaluations
+            ),
             "gradient_penalty_formula": "sum_j_relu(norm_dE_dtarget_minus_margin)^2",
             "gradient_penalty_vjp": "exact_analytic_into_trainable_RFF_theta",
             "gradient_penalty_reduction": "sum_candidates_then_mean_batch",
@@ -907,8 +923,10 @@ class _ContrastiveEnergyModel:
             "remaining_upstream_drift": [
                 "fixed_random_Fourier_basis_and_ridge_center_replace_four_layer_trainable_MLP",
                 "training chain selects the official release polynomial schedule rather than paper Eq23 epsilon-squared drift",
+                "inference uses center-plus-Gaussian initialization, unit noise, clip 10, and project step count rather than a paper/release-aligned sampler",
                 "no_claim_of_official_benchmark_numerical_parity",
             ],
+            "inference_protocol_status": "NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT",
             "inference_sampler": "Langevin",
             "langevin_steps": self.langevin_steps,
             "langevin_step_size": self.langevin_step_size,
@@ -1263,6 +1281,11 @@ class _BaseMBOPE:
             actor_calls += 1
             alive[rows] = ~environment_terminal & (timestep[rows] < self.horizon)
         estimate_seconds = perf_counter() - started
+        inference_langevin_gradient_evaluations = 0
+        if isinstance(self._model, _ContrastiveEnergyModel):
+            inference_langevin_gradient_evaluations = (
+                actor_rows * self._model.langevin_steps
+            )
         diagnostics = {
             **self._fit_diagnostics,
             "rollout_return_std": float(np.std(returns)),
@@ -1280,6 +1303,10 @@ class _BaseMBOPE:
             "rollout_key_digest": _key_digest(root_keys),
             "runtime_seconds": float(self._fit_seconds + estimate_seconds),
         }
+        if isinstance(self._model, _ContrastiveEnergyModel):
+            diagnostics["inference_langevin_gradient_evaluation_count"] = (
+                inference_langevin_gradient_evaluations
+            )
         support = {
             "behavior_density_required": False,
             "kind": "learned_model_rollout_global_behavior_action_z",
@@ -1299,6 +1326,10 @@ class _BaseMBOPE:
             "scientific_role": self.identity["scientific_role"],
             "upstream_parity_claim": "NONE",
         }
+        if self.identity["scientific_role"] == "PROJECT_ETM_PROTOCOL_ADAPTATION":
+            provenance["production_status"] = (
+                "NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT"
+            )
         cost = {
             "fit_seconds": float(self._fit_seconds),
             "estimate_seconds": float(estimate_seconds),
@@ -1306,6 +1337,10 @@ class _BaseMBOPE:
             "model_rollout_steps": actor_rows,
             "actor_queries": actor_rows,
         }
+        if isinstance(self._model, _ContrastiveEnergyModel):
+            cost["inference_langevin_gradient_evaluations"] = (
+                inference_langevin_gradient_evaluations
+            )
         return _make_value_estimate(
             method_id=self.method_id,
             status="PASS",

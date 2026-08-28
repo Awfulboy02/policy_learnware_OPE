@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 
 import policy_learnware_ope.cli as cli_module
-from policy_learnware_ope.adapters import RAW_QUERY_SCHEMA
+from policy_learnware_ope.adapters import RAW_QUERY_SCHEMA, sha256_file
 from policy_learnware_ope.benchmark import load_ranking_seal
 from policy_learnware_ope.cli import _raw_membership_digest, _toy_batch, main, run_toy
 
@@ -22,8 +24,20 @@ EXPECTED_METHODS = {
 }
 
 
-def test_toy_runner_fits_all_methods_seals_then_exports_metrics(tmp_path: Path):
+def test_toy_runner_fits_all_methods_seals_then_exports_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     output = tmp_path / "toy"
+    original_oracle = cli_module._toy_oracle
+
+    def oracle_after_all_seals(*args, **kwargs):
+        assert {
+            path.stem for path in (output / "seals").glob("*.json")
+        } == EXPECTED_METHODS
+        return original_oracle(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_toy_oracle", oracle_after_all_seals)
     result = run_toy(output, seed=17, implementation_commit="c" * 40)
 
     assert result["status"] == "TOY_MVP_PASS"
@@ -62,9 +76,34 @@ def test_toy_runner_fits_all_methods_seals_then_exports_metrics(tmp_path: Path):
         assert len(rows) == 5
         assert {row["status"] for row in rows.values()} == {"PASS"}, method_id
         assert {row["method_id"] for row in rows.values()} == {method_id}
+        for candidate_id, row in rows.items():
+            assert row["provenance"]["candidate_id"] == candidate_id
+            assert row["provenance"]["value_convention"] == "J_gamma=0.99_H=5_raw"
+            assert row["cost"]["fit_transitions"] > 0
+            assert row["cost"]["timing_artifact"] == "runtime.json"
+            assert not any(key.endswith("_seconds") for key in row["cost"])
+    fqe_cost = result["estimates"]["FH_FQE_G099_H5"]["toy-policy-0"]["cost"]
+    assert fqe_cost["iterations"] > 0
+    assert fqe_cost["linear_solves"] == 1
+    kmi_cost = result["estimates"]["FH_KMIFQE_G099_H5"]["toy-policy-0"]["cost"]
+    assert kmi_cost["hessian_updates"] > 0
+    assert kmi_cost["target_updates"] > 0
+    etm_cost = result["estimates"]["ETM_MBOPE_G099_H5"]["toy-policy-0"]["cost"]
+    assert etm_cost["inference_langevin_gradient_evaluations"] > 0
     assert (output / result["artifacts"]["metrics_json"]).is_file()
     assert (output / result["artifacts"]["metrics_csv"]).is_file()
     assert (output / result["artifacts"]["runtime"]).is_file()
+    assert result["artifacts"]["runtime_sha256"] == sha256_file(
+        output / result["artifacts"]["runtime"]
+    )
+    assert (
+        result["method_scope"]["FH_KMIFQE_G099_H5"]["production_status"]
+        == "NO_GO_OPS_DS_DENSE_HESSIAN_PANEL"
+    )
+    assert (
+        result["method_scope"]["ETM_MBOPE_G099_H5"]["production_status"]
+        == "NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT"
+    )
     query = json.loads((output / result["artifacts"]["raw_query"]).read_text())
     assert query["schema"] == RAW_QUERY_SCHEMA
     assert set(query["fields"]) == {
@@ -187,6 +226,24 @@ def test_real_preflight_is_stable_and_all_production_gates_are_no_go(
         "exact_behavior_density",
     }
     assert {gate["status"] for gate in report["required_gates"].values()} == {"NO_GO"}
+    assert set(report["method_blockers"]) == {
+        "FH_KMIFQE_G099_H1000",
+        "ETM_MBOPE_G099_H1000",
+    }
+    blocker_codes = {
+        blocker["code"]
+        for blockers in report["method_blockers"].values()
+        for blocker in blockers
+    }
+    assert blocker_codes == {
+        "NO_GO_OPS_DS_DENSE_HESSIAN_PANEL",
+        "NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT",
+    }
+    assert {
+        blocker["status"]
+        for blockers in report["method_blockers"].values()
+        for blocker in blockers
+    } == {"NO_GO"}
     assert report["raw_adapter"]["status"] == "NO_GO"
 
 
@@ -233,3 +290,68 @@ def test_cli_outputs_are_no_clobber_and_never_enter_another_git_repo(
     with pytest.raises(PermissionError, match="different Git repository"):
         run_toy(forbidden, seed=1, implementation_commit="f" * 40)
     assert not forbidden.exists()
+
+
+def test_installed_layout_never_inherits_or_writes_foreign_git_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source_root = cli_module._verified_source_checkout()
+    assert source_root == Path(cli_module.__file__).resolve().parents[2]
+    source_output = source_root / "artifacts" / "r0-source-layout-check"
+    assert cli_module._guard_output_location(source_output) == source_output
+
+    foreign = tmp_path / "foreign-consumer"
+    foreign.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=foreign, check=True)
+    (foreign / "pyproject.toml").write_text(
+        '[project]\nname = "foreign-consumer"\nversion = "1.0"\n',
+        encoding="utf-8",
+    )
+    (foreign / "consumer.txt").write_text("foreign identity\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=foreign, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=R0 Test",
+            "-c",
+            "user.email=r0@example.invalid",
+            "commit",
+            "-qm",
+            "foreign fixture",
+        ],
+        cwd=foreign,
+        check=True,
+    )
+    foreign_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=foreign,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+    installed_package = foreign / "site" / "policy_learnware_ope"
+    shutil.copytree(
+        Path(cli_module.__file__).resolve().parent,
+        installed_package,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    monkeypatch.setattr(cli_module, "__file__", str(installed_package / "cli.py"))
+    monkeypatch.setattr(cli_module, "distribution_version", lambda _name: "0.4.1b0")
+
+    identity = cli_module._implementation_identity()
+    assert identity["package_version"] == "0.4.1b0"
+    assert identity["worktree_status"] == "INSTALLED_IMMUTABLE_CONTENT"
+    assert identity["tree"] != foreign_head
+    assert foreign_head not in identity["commit"]
+    with pytest.raises(PermissionError, match="different Git repository"):
+        cli_module._guard_output_location(foreign / "artifacts" / "installed-toy")
+    outside = tmp_path / "outside-consumer" / "installed-toy"
+    assert cli_module._guard_output_location(outside) == outside.resolve()
+    assert cli_module._implementation_identity("e" * 40) == {
+        "commit": "e" * 40,
+        "tree": "CALLER_SUPPLIED",
+        "worktree_status": "CALLER_SUPPLIED",
+    }

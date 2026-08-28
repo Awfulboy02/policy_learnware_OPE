@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from hashlib import sha256
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 import json
 from pathlib import Path
 import subprocess
 from time import perf_counter
+import tomllib
 from typing import Any, Sequence
 
 import numpy as np
@@ -113,12 +115,63 @@ def _containing_git_root(path: Path) -> Path | None:
     return None
 
 
+def _verified_source_checkout() -> Path | None:
+    """Return this package's Git root only for the canonical src layout."""
+
+    current_file = Path(__file__).resolve()
+    candidate = current_file.parents[2]
+    expected_cli = candidate / "src" / "policy_learnware_ope" / "cli.py"
+    pyproject = candidate / "pyproject.toml"
+    try:
+        metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        project_name = metadata["project"]["name"]
+        same_cli = expected_cli.samefile(current_file)
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        return None
+    if not (candidate / ".git").exists() or project_name != "policy-learnware-ope":
+        return None
+    return candidate if same_cli else None
+
+
+def _installed_package_identity() -> dict[str, Any]:
+    package_root = Path(__file__).resolve().parent
+    try:
+        package_version = distribution_version("policy-learnware-ope")
+        status = "INSTALLED_IMMUTABLE_CONTENT"
+    except PackageNotFoundError:
+        package_version = "UNAVAILABLE"
+        status = "UNVERIFIED_PACKAGE_LAYOUT"
+    files = sorted(
+        path for path in package_root.rglob("*.py") if path.is_file()
+    )
+    manifest = {
+        "schema": "policy-learnware.installed-python-tree.v1",
+        "distribution": "policy-learnware-ope",
+        "version": package_version,
+        "files": [
+            {
+                "path": path.relative_to(package_root).as_posix(),
+                "sha256": sha256(path.read_bytes()).hexdigest(),
+            }
+            for path in files
+        ],
+    }
+    tree_digest = _payload_digest(manifest)
+    return {
+        "commit": f"PACKAGE_CONTENT_SHA256:{tree_digest}",
+        "tree": tree_digest,
+        "worktree_status": status,
+        "package_name": "policy-learnware-ope",
+        "package_version": package_version,
+    }
+
+
 def _guard_output_location(path: str | Path) -> Path:
     """Reject writes into any Git repository other than this companion."""
 
     destination = Path(path).resolve()
     containing_repo = _containing_git_root(destination)
-    companion_repo = Path(__file__).resolve().parents[2]
+    companion_repo = _verified_source_checkout()
     if containing_repo is not None and containing_repo != companion_repo:
         raise PermissionError(
             f"refusing to write into a different Git repository: {containing_repo}"
@@ -133,7 +186,9 @@ def _implementation_identity(commit_override: str | None = None) -> dict[str, An
             "tree": "CALLER_SUPPLIED",
             "worktree_status": "CALLER_SUPPLIED",
         }
-    repository = Path(__file__).resolve().parents[2]
+    repository = _verified_source_checkout()
+    if repository is None:
+        return _installed_package_identity()
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -368,7 +423,12 @@ def _without_volatile_fields(value: Any) -> Any:
 
 def _stable_estimate(estimate: ValueEstimate) -> dict[str, Any]:
     payload = _without_volatile_fields(estimate.to_dict())
-    payload["cost"] = {"reported_separately": "runtime.json"}
+    # Preserve deterministic work counts (iterations, transitions, actor
+    # queries, linear solves, and similar) while keeping wall-clock timing out
+    # of the reproducibility payload and ranking seal.
+    stable_cost = dict(payload.get("cost", {}))
+    stable_cost["timing_artifact"] = "runtime.json"
+    payload["cost"] = stable_cost
     return payload
 
 
@@ -394,6 +454,7 @@ def _toy_method_scope(method_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
                 ),
                 "scientific_role": "B20_PROTOCOL_ADAPTATION",
                 "official_paper_parity": False,
+                "production_status": "NO_GO_OPS_DS_DENSE_HESSIAN_PANEL",
             }
         elif method_id.startswith("ETM_MBOPE_"):
             scopes[method_id] = {
@@ -404,6 +465,7 @@ def _toy_method_scope(method_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
                 ),
                 "scientific_role": "PROJECT_ETM_PROTOCOL_ADAPTATION",
                 "official_paper_parity": False,
+                "production_status": "NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT",
             }
         elif method_id.startswith("DOPE_STYLE_MB_FF_"):
             scopes[method_id] = {
@@ -811,6 +873,7 @@ def run_toy(
         "method_runtime_seconds": runtime_by_method,
     }
     _write_json(destination / "runtime.json", runtime_payload)
+    runtime_digest = sha256_file(destination / "runtime.json")
     stable_estimates = {
         method_id: {
             candidate_id: _stable_estimate(estimate)
@@ -864,6 +927,7 @@ def run_toy(
             "metrics_csv": "metrics.csv",
             "metrics_csv_sha256": metric_paths["csv_sha256"],
             "runtime": "runtime.json",
+            "runtime_sha256": runtime_digest,
             "raw_query": "raw_query.reward_free.json",
             "raw_query_sha256": query_artifact_digest,
             "raw_membership_sha256": raw_membership_digest,
@@ -918,6 +982,28 @@ def build_real_preflight(*, implementation_commit: str | None = None) -> dict[st
         "config": config,
         "config_sha256": _payload_digest(config),
         "required_gates": required_gates,
+        "method_blockers": {
+            "FH_KMIFQE_G099_H1000": [
+                {
+                    "status": "NO_GO",
+                    "code": "NO_GO_OPS_DS_DENSE_HESSIAN_PANEL",
+                    "reason": (
+                        "the current per-row dense Hessian/metric materialization is not "
+                        "qualified for the million-row OPS-DS panel"
+                    ),
+                }
+            ],
+            "ETM_MBOPE_G099_H1000": [
+                {
+                    "status": "NO_GO",
+                    "code": "NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT",
+                    "reason": (
+                        "the project inference Langevin initialization/noise/clipping/step "
+                        "protocol is not aligned with either the B22 paper or official release"
+                    ),
+                }
+            ],
+        },
         "raw_adapter": {
             "status": "NO_GO",
             "code": "NO_GO_RAW_OPERATOR_AUTHORITY",

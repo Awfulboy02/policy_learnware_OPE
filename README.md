@@ -39,11 +39,22 @@ policy-learnware-ope real-preflight --output artifacts/real-preflight.json
 pytest
 ```
 
+R0 validates both the source checkout and an untracked `0.4.1b0` wheel built
+offline with the declared `setuptools>=77` backend. Installed code never treats
+a consumer repository as this companion checkout: its implementation identity
+is the installed distribution version plus a digest of sorted package Python
+files, and outputs inside any host Git repository are rejected. Source-checkout
+identity is read from Git only after the canonical `src/` layout, project name,
+and current `cli.py` path are verified.
+
 The real preflight intentionally exits nonzero and records `NO_GO` for the
 three presently missing capabilities: verified actor authority, exact
 arbitrary-action behavior density, and a per-step oracle bound to
-`J(gamma=.99,H=1000)`. Production Raw is separately `NO_GO`. No recollection,
-policy retraining, oracle rewriting, or old-asset mutation is performed.
+`J(gamma=.99,H=1000)`. Production Raw is separately `NO_GO`. It also exposes
+the method-level `NO_GO_OPS_DS_DENSE_HESSIAN_PANEL` and
+`NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT` blockers without changing synthetic
+toy estimates from `PASS`. No recollection, policy retraining, oracle rewriting,
+or old-asset mutation is performed.
 
 Ranking seals are canonical, write-once payloads. Their SHA-256 is retained by
 a separate run manifest and must be supplied when loading or joining an oracle.

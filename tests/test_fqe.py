@@ -119,6 +119,9 @@ def test_fqe_recovers_known_finite_horizon_value_and_uses_native_time() -> None:
     assert result.value == pytest.approx(1.0 + 0.99 + 0.99**2, abs=2e-6)
     assert result.provenance["time_input"] == "native_timestep/H"
     assert result.provenance["target_time"] == "(native_timestep+1)/H"
+    assert result.provenance["value_convention"] == "J_gamma=0.99_H=3_raw"
+    assert len(result.provenance["fit_key_digest"]) == 64
+    assert len(result.provenance["estimate_key_digest"]) == 64
     assert result.diagnostics["converged"] is True
     assert result.diagnostics["bootstrap_rows"] == 2 * batch.episode_count
     assert result.support["kind"] == "pointwise_logged_state_action_distance"
@@ -393,6 +396,9 @@ def test_kmifqe_recovers_known_value_and_queries_arbitrary_density() -> None:
     assert result.support["ess_fraction"] == pytest.approx(1.0)
     assert result.provenance["method_identity"] == "B20_PROTOCOL_ADAPTATION"
     assert result.provenance["official_parity"] is False
+    assert result.provenance["value_convention"] == "J_gamma=0.99_H=3_raw"
+    assert len(result.provenance["fit_key_digest"]) == 64
+    assert len(result.provenance["estimate_key_digest"]) == 64
     # One exact-density query for logged a' and another for pi(s').
     assert len(density.calls) == 2
     np.testing.assert_allclose(density.calls[0], 0.0, rtol=1e-12, atol=1e-14)

@@ -459,6 +459,20 @@ def test_etm_training_negatives_are_conditional_langevin_and_seed_reproducible()
     assert first_diagnostics["epochs_entered"] == 2
     assert first_diagnostics["langevin_negative_chain_count"] > 0
     assert first_diagnostics["langevin_negative_step_count"] > 0
+    assert (
+        first_diagnostics["training_langevin_gradient_evaluation_count"]
+        == first_diagnostics["langevin_negative_step_count"]
+    )
+    assert first_diagnostics["final_panel_langevin_chain_count"] > 0
+    assert first_diagnostics["final_panel_langevin_gradient_evaluation_count"] > 0
+    assert first_diagnostics["fit_langevin_gradient_evaluation_count"] == (
+        first_diagnostics["training_langevin_gradient_evaluation_count"]
+        + first_diagnostics["final_panel_langevin_gradient_evaluation_count"]
+    )
+    assert (
+        first_diagnostics["inference_protocol_status"]
+        == "NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT"
+    )
     assert first_diagnostics["training_chain_mean_displacement"] > 0.0
     assert first_diagnostics["final_panel_chain_mean_displacement"] > 0.0
     training_energy_scale = max(
@@ -536,10 +550,29 @@ def test_etm_training_negatives_are_conditional_langevin_and_seed_reproducible()
 
     initial = np.asarray([[-0.4], [0.6]])
     rollout_keys = np.asarray([71, 72], dtype=np.uint64)
-    first_value = first.estimate(initial, keys=rollout_keys).value
+    first_result = first.estimate(initial, keys=rollout_keys)
+    first_value = first_result.value
     second_value = second.estimate(initial, keys=rollout_keys).value
     assert np.isfinite(first_value)
     assert first_value == pytest.approx(second_value, rel=1e-9, abs=1e-10)
+    assert first_result.provenance["production_status"] == (
+        "NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT"
+    )
+    assert first_result.cost["inference_langevin_gradient_evaluations"] == (
+        first_result.diagnostics["actor_rows"] * config["inference_langevin_steps"]
+    )
+
+    zero_ablation = _small_etm(
+        contrastive_steps=1,
+        epochs=1,
+        training_noise_scale=0.0,
+        gradient_penalty_weight=0.0,
+    ).fit(batch, LinearActor(), fit_keys=np.asarray([991], dtype=np.uint64))
+    zero_result = zero_ablation.estimate(initial, keys=rollout_keys)
+    assert np.isfinite(zero_result.value)
+    zero_config = zero_result.diagnostics["actual_training_config"]
+    assert zero_config["training_noise_scale"] == 0.0
+    assert zero_config["gradient_penalty_weight"] == 0.0
 
 
 def test_etm_non_finite_training_fails_before_publishing_model() -> None:

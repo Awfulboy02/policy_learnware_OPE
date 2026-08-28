@@ -9,6 +9,7 @@ Bellman estimators, not placeholder score generators.  Both critics consume
 
 from __future__ import annotations
 
+from hashlib import sha256
 from time import perf_counter
 from typing import Any
 
@@ -25,6 +26,7 @@ from .core import (
     behavior_log_prob,
     candidate_actions,
     finite_horizon_method_id,
+    finite_horizon_value_convention,
     policy_id,
     policy_semantics,
     validate_action_keys,
@@ -34,6 +36,10 @@ from .kmifqe import B20KMIFQETrainer, seed_from_keys
 
 FH_FQE_METHOD_ID = "FH_FQE_G099_H1000"
 FH_KMIFQE_METHOD_ID = "FH_KMIFQE_G099_H1000"
+
+
+def _key_digest(keys: np.ndarray) -> str:
+    return sha256(np.asarray(keys, dtype="<u8").tobytes()).hexdigest()
 
 
 class _QuadraticTimeFeatures:
@@ -165,6 +171,7 @@ class FiniteHorizonFQE:
             keys = validate_action_keys(fit_keys, len(batch))
             semantics = policy_semantics(candidate)
             self._base_provenance(batch, semantics)
+            self._provenance["fit_key_digest"] = _key_digest(keys)
             if semantics is not PolicySemantics.DETERMINISTIC:
                 self._close_gate(
                     EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS,
@@ -196,7 +203,9 @@ class FiniteHorizonFQE:
             "adaptation": "FINITE_HORIZON_PROTOCOL_ADAPTATION",
             "gamma": self.gamma,
             "horizon": self.horizon,
-            "value_convention": "raw_discounted_return",
+            "value_convention": finite_horizon_value_convention(
+                self.gamma, self.horizon
+            ),
             "time_input": "native_timestep/H",
             "target_time": "(native_timestep+1)/H",
             "mask_contract": {
@@ -370,6 +379,8 @@ class FiniteHorizonFQE:
         if observations.ndim != 2 or len(observations) == 0 or not np.all(np.isfinite(observations)):
             raise ValueError("initial_observations must be a non-empty finite 2-D matrix")
         checked_keys = validate_action_keys(keys, len(observations))
+        estimate_provenance = dict(self._provenance)
+        estimate_provenance["estimate_key_digest"] = _key_digest(checked_keys)
         raw_times = np.asarray(initial_timestep)
         if raw_times.dtype.kind not in "iu" or raw_times.dtype.kind == "b":
             raise ValueError("initial_timestep must contain integers")
@@ -392,7 +403,7 @@ class FiniteHorizonFQE:
                 status=status,
                 value=None,
                 support=self._support,
-                provenance=self._provenance,
+                provenance=estimate_provenance,
                 cost=cost,
                 diagnostics=diagnostics,
             )
@@ -423,7 +434,7 @@ class FiniteHorizonFQE:
             status=EstimateStatus.PASS,
             value=float(np.mean(values)),
             support=self._support,
-            provenance=self._provenance,
+            provenance=estimate_provenance,
             cost=cost,
             diagnostics=diagnostics,
         )
@@ -529,6 +540,7 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
             except DataValidationError:
                 semantics = PolicySemantics.STOCHASTIC_KEYED
             self._base_provenance(batch, semantics)
+            self._provenance["fit_key_digest"] = _key_digest(keys)
             self._provenance.pop("planned_neural_critic_port", None)
             self._provenance.update(
                 {
