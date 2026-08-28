@@ -43,9 +43,18 @@ R0 validates both the source checkout and an untracked `0.4.1b0` wheel built
 offline with the declared `setuptools>=77` backend. Installed code never treats
 a consumer repository as this companion checkout: its implementation identity
 is the installed distribution version plus a digest of sorted package Python
-files, and outputs inside any host Git repository are rejected. Source-checkout
-identity is read from Git only after the canonical `src/` layout, project name,
-and current `cli.py` path are verified.
+files, and outputs inside a detected foreign worktree or bare Git repository
+are rejected. A malformed `core.bare` value or unreadable bare-repository config
+produces Git `config --bool` return code 128 and also fails closed; the valid
+`core.bare=yes` form is recognized normally, and output outside Git repositories
+remains allowed.
+Source-checkout identity is read from Git only after the canonical `src/`
+layout, project name, and current `cli.py` path are verified. The R0 runtime
+freeze is commit `277c815eb44b8b10abff2c687d8b585031b3d2b3`, tree
+`b00c3a40bc65e58aed2795ca0ce150cd5033cc22`. A no-`.git` archive is used for
+isolated import/tests and as wheel build input; immutable distribution-version
+and package-content identity claims come from a fresh wheel install, not from
+ambient editable metadata.
 
 The real preflight intentionally exits nonzero and records `NO_GO` for the
 three presently missing capabilities: verified actor authority, exact

@@ -203,54 +203,68 @@ OPE 仓受保护引用在算法提交前后保持：
 
 ## 12. 报告副本
 
-canonical tracked copy 位于 OPE 仓库根目录。v0.41b 初始报告曾同步到 workspace 根目录和服务器 `/share/songyf/RL_Learnware/` 文档目录；R0 release appendix 在交叉审计放行前只更新 canonical 与本地 workspace 副本，服务器副本按边界留待 R1。报告自身不嵌入自身 SHA-256，以避免自引用；发布后由外部 `sha256sum` 核验最终副本。
+canonical tracked copy 位于 OPE 仓库根目录。v0.41b 初始报告曾同步到 workspace 根目录和服务器 `/share/songyf/RL_Learnware/` 文档目录；本 R0 source-release doc tip 只同步 canonical 与本地 workspace 副本，服务器副本按边界留待 R1。报告自身不嵌入自身 SHA-256，以避免自引用；发布后由外部 `sha256sum` 核验 canonical、workspace 副本与 final-tip archive member 三份字节，服务器 hash 将在 R1 单独对齐。
 
 ## 13. R0 大规模发包前轻量化验收附录
 
 ### 13.1 纠偏范围与实现身份
 
-R0 代码提交为 `5a3525eebc96126e2bf41496b00eb205f892ebd4`，tree 为 `0b41559cb8282d51b230055871536dc23f83bef2`。该提交只修改现有 `README.md`、`cli.py`、`fqe.py`、`mbope.py` 与三个现有测试文件，没有新增 registry/contract/tolerance framework，也没有触碰 baseline 算法身份、ranking seal/oracle join 或 Raw 协议。
+R0 的 release identity/cost 主提交为 `5a3525e...`；archive-layout 测试与首版附录提交为 `8bc6bd6...`；bare-repo output guard 的聚焦跟进为 `c070060...`、`43fcd0b...`、`277c815...`。最终完成三布局审计的 runtime commit 为 `277c815eb44b8b10abff2c687d8b585031b3d2b3`，tree 为 `b00c3a40bc65e58aed2795ca0ce150cd5033cc22`。R0 仍只修改现有 `README.md`、`Policy_Learnware_v0.41b_Improvement_Report.md`、`cli.py`、`fqe.py`、`mbope.py` 与三个现有测试文件，没有新增 registry/contract/tolerance framework，也没有触碰 baseline 算法身份、ranking seal/oracle join 或 Raw 协议。
+交叉审计在该 code-freeze 点给出 `CODE PASS`；当时本地 `v041b` 相对 `origin/v041b@09ea30e...` 为 ahead 7。本节之后的 source-release doc commit 只改 README/报告，不再改运行代码。
 
 纠偏闭合了四个发包审计缺口：
 
-- source checkout 只有同时验证 `.git`、`pyproject.toml` 的 project name 与真实 `src/policy_learnware_ope/cli.py` 后才读取 Git identity；wheel/installed layout 改为导出 distribution version 与按相对路径排序的包内 Python 内容 digest。安装在 foreign consumer Git 内时不会继承宿主 HEAD/tree，向任何宿主 Git 写 artifact 都会拒绝，repo 外输出保持可用；caller-supplied commit 语义不变。
-- `run.json` 不再抹掉候选级稳定 cost：FQE 的 iteration/linear-solve、KMIFQE 的 Hessian/target/linear-solve、model-based 的 transition/rollout/action-query，以及 ETM inference gradient-evaluation count 均保留；`*_seconds` 仍在 ranking seal 与稳定 estimate 外，`runtime.json` 由单独 SHA-256 绑定。
+- source checkout 只有同时验证 `.git`、`pyproject.toml` 的 project name 与真实 `src/policy_learnware_ope/cli.py` 后才读取 Git identity。无 `.git` archive 仅用于隔离 import/全量测试及 wheel 构建输入；distribution version 与按相对路径排序的包内 Python content identity 由 fresh wheel install 验证，不把 ambient editable metadata 当作 archive 发布身份。安装在 foreign consumer worktree 内时不会继承宿主 HEAD/tree；Git `config --bool` 正常识别 `core.bare=yes`，malformed boolean 与不可读 config 均返回 rc 128 并 fail closed，foreign worktree 也拒绝写入，repo 外输出保持可用；caller-supplied commit 语义不变。
+- `run.json` 不再抹掉候选级稳定 cost：FQE 的 iteration/linear-solve、KMIFQE 的 Hessian/target/linear-solve、model-based 的 transition/rollout/action-query，以及 ETM inference gradient-evaluation count 均保留；`*_seconds` 仍在 ranking seal 与稳定 estimate 外，`runtime.json` 由单独 SHA-256 绑定。model-based transition-model fit 是候选池共享成本，虽然为审计方便随各 candidate estimate 导出，汇总表不得把它按 candidate 重复相加。
 - FQE/KMIFQE cell provenance 现在导出精确 `J_gamma=..._H=..._raw` 以及 fit/estimate key digest；toy oracle callback 回归证明六个 ranking seal 全部落盘后才调用 oracle。
 - ETM 导出 training、final diagnostic panel 与 inference Langevin gradient-evaluation 分项计数；KMIFQE dense panel 和 ETM inference alignment 两个科学阻塞进入 toy method scope 与 real-preflight 的机器可读 `method_blockers`。synthetic `ValueEstimate` 仍按实际执行结果为 `PASS`，没有把正式协议 NO_GO 混成 toy 失败。
 
 ### 13.2 测试、资源与失败覆盖
 
-clean `5a3525e...` 上的最终命令与结果：
+code-freeze `277c815...` 的独立 clean archive 审计命令与结果：
 
 ```text
-.venv/bin/python -m pytest -q
-94 passed in 10.40s
-wallclock 10.57s; peak RSS 62,357,504 bytes
+git archive 277c815... + PYTHONPATH=<archive>/src pytest -q
+94 passed in 10.58s
 
-.venv/bin/python -m pytest -q <candidate permutation + no-clobber + preflight +
-installed-layout + FQE/KMIFQE density/adjacency/support/convergence/nonfinite +
-MB/ETM refit/nonfinite/zero-ablation + Raw/dataset corruption focused nodes>
-23 passed in 5.78s
+CLI + benchmark + adapters: 64 passed
+FQE + KMIFQE + model-based: 30 passed
+leakage + status + fail-closed: 31 passed
 
 git diff --check
 PASS
+
+python -m policy_learnware_ope.cli --help
+PASS
 ```
+
+三组聚焦计数有重叠，不与 94 做算术相加；其目的是分别确认 CLI/导出宽度、方法机制和安全状态路径。source-release doc tip 提交后还会再跑一次 repo 全量与 archive 全量；该 post-commit 结果记入外部 release manifest，避免报告自引用。
 
 聚焦失败覆盖包含：NaN/row-count corruption、shape/ABI、sample-ordinal/native-time、missing/unknown density、missing/unverified adjacent action、实质 adjacent-action mismatch、support/ESS、stale target、FQE/KMIFQE nonconvergence/nonfinite、MB failed refit、ETM nonfinite optimizer，以及 Raw response digest/schema。合法 `training_noise_scale=0` 与 `gradient_penalty_weight=0` 消融仍能 fit/estimate，实际配置如实导出；没有放宽 production adjacency/density/oracle/authority gate。
 
 ### 13.3 三种子端到端、重放与产物规模
 
-六条方法（Raw fixture + 五条 fitted estimators）在 source CLI 上完成 `fit → estimate → seal → oracle join → metrics/export`：
+六条方法（Raw fixture + 五条 fitted estimators）在隔离 Git clean checkout `277c815/b00c3a` 上完成 `fit → estimate → seal → oracle join → metrics/export`：
 
 | seed | 状态 | wallclock | peak RSS | artifact size | discrete reproducibility SHA-256 |
 |---:|---|---:|---:|---:|---|
-| 7 | `TOY_MVP_PASS` | 1.802s | 43,040,768 B | 588 KiB | `cf25d446c0ef4ed12287dc28a548b68762b4de6b7e3e29c616acd41786963f46` |
-| 41 | `TOY_MVP_PASS` | 1.889s | 42,909,696 B | 608 KiB | `9b06b63922078447b852ce9a74fc6c1cd7281a08abc11c4fdcb1e0ec48969893` |
-| 99 | `TOY_MVP_PASS` | 2.113s | 42,876,928 B | 640 KiB | `044fe8cdd1e9a88f2ed004e96ca1b59a4d39d27b911e3384c9659fb73350ec24` |
+| 7 | `TOY_MVP_PASS` | 1.89s | 43,237,376 B | 565,900 B | `d24f0d042d48963a91515d5bdf595c2ea9c64d1ee78a0e47ab80e1b881411c78` |
+| 41 | `TOY_MVP_PASS` | 1.89s | 42,745,856 B | 587,858 B | `d546628c6f169763264d41447144595925a0edaf834cc0d94f36c5360a6ef98a` |
+| 99 | `TOY_MVP_PASS` | 2.09s | 43,057,152 B | 619,255 B | `ac405e3b6e28d99bd0ebfec2d6df10a94529be4a79008f6329dc931b62d66da2` |
 
-seed 41 独立重放为 1.897s、42,942,464 B、608 KiB；六个 ranking-seal SHA、reproducibility SHA，以及删除 seal 外 runtime 后包含 estimates/cost/metrics/rank/status 的完整稳定投影均逐字节一致。候选池反序测试按 candidate ID 对齐后采用 `float64` 尺度容差比较 value，并要求 ranking/winner 精确不变；测试通过。三种子允许因数据/seed 变化产生不同估计和 ETM/KMIFQE winner，但每个 cell 的 method ID 均为实际 `G099_H5`，不是伪装的 `H1000`。
+seed 41 独立重放为 1.92s、42,860,544 B、587,850 B；六个 ranking-seal SHA、reproducibility SHA，以及删除 seal 外 runtime 后包含 estimates/cost/metrics/rank/status 的完整稳定投影均逐字节一致。候选池反序测试按 candidate ID 对齐后采用 `float64` 尺度容差比较 value，并要求 ranking/winner 精确不变；测试通过。三种子允许因数据/seed 变化产生不同估计和 ETM/KMIFQE winner，但每个 cell 的 method ID 均为实际 `G099_H5`，不是伪装的 `H1000`。
 
-产物最大项仍是包含 KMIFQE 机制 history 的 seal/run；单次总量不超过 640 KiB，本轮没有为这个小规模 fixture 扩建 artifact 裁剪系统。
+独立 clean archive-built wheel 的 fresh-install 审计另外运行 seeds 0/7/41，全部 `TOY_MVP_PASS`；下列 identity 属于 installed distribution，不是 ambient-metadata 下直接 `PYTHONPATH` 执行 archive 的身份声明：
+
+| seed | run.json SHA-256 | reproducibility SHA-256 | artifact bytes |
+|---:|---|---|---:|
+| 0 | `33f288f96b6797d30061d813f4bf404e202b38b4a5e450d392ef6face4c919f6` | `9a84e2dbb06bd3533ca64e4771b9e6dab9c644626e77479a5b06ca372772cc3b` | 609,338 |
+| 7 | `1308afa58c94cbd33c459b06751831e2d5039c96c125252db133c32d4303d9f7` | `260c9a8f8af4297e869c9070507e3dde15ab93a0480bde74c04df9158dac4322` | 567,780 |
+| 41 | `c0faac8a5222f2ef4f9e18719617802e3bf630ac9b4ea6512f80c4093f8e93f4` | `e93d1bc9e27900b78056859343463e8ea0945ec3ecfa0d7e246eec43c155a797` | 589,746 |
+
+该 fresh-install seed 7 的 replay 与 candidate-order reversal 按 candidate ID 对齐后，六方法 ranking、winner、seal SHA 与 reproducibility SHA `260c9a8f8af4297e869c9070507e3dde15ab93a0480bde74c04df9158dac4322` 均精确不变。`run.json` 本身包含 seal 外 runtime artifact 引用，不把它误当作 replay 字节相等的对象。
+
+产物最大项仍是包含 KMIFQE 机制 history 的 seal/run；上述单次总量不超过 610 KiB，本轮没有为这个小规模 fixture 扩建 artifact 裁剪系统。
 
 ### 13.4 Offline wheel 与 installed-layout 动态验收
 
@@ -261,12 +275,14 @@ python -m pip wheel --no-index --no-build-isolation --no-deps --wheel-dir <temp>
 SUCCESS: policy_learnware_ope-0.4.1b0-py3-none-any.whl
 ```
 
-该次 clean-commit wheel 为 70,604 bytes，artifact SHA-256 `64b8ac7c4a1e281dbf51b4f46abf1d3ca0644b431efa0fcdbe1a232595755c3e`。METADATA 确认为 version `0.4.1b0`、Python `>=3.11`、MIT、`numpy==2.5.2` 与 test extra `pytest==9.1.1`；archive 只含九个包内 Python 文件、LICENSE 与标准 dist-info，没有冻结资产。
+在 code-freeze 内容上得到两个合法的 wheel 传输字节：clean-checkout build 为 70,781 bytes，SHA-256 `52b08553ea5ea938ab0dc53d5301811a90b9172c0e1c6f3ecb7898482b21cfa3`；clean archive build 也为 70,781 bytes，SHA-256 `2e7abd3a2c03c0486a48e3d29e9a11dc3215604f64e91e158e60619f3ecc5bde`。两者解包均为 15 个文件、292,293 bytes，package Python content identity 均为 `a0999de8ef9efececec3e2520a2dabe2cec365d1237cf309cdcc8aba1c6e40f9`；wheel SHA 差异来自 ZIP timestamp，不是代码或包身份冲突。METADATA 确认 version `0.4.1b0`、Python `>=3.11`、MIT、`numpy==2.5.2` 与 test extra `pytest==9.1.1`，没有冻结资产。
 
-wheel 被安装到一个有独立 commit 的 foreign Git consumer 下的 clean target。动态证据为：module 从 target 导入；identity 为 `package_version=0.4.1b0`、`worktree_status=INSTALLED_IMMUTABLE_CONTENT`、package Python tree digest `cf78c43378f1f5966746e976d3fc4469dc29972fc65d1b7acdf4f7db499b5847`，不等于 foreign HEAD；foreign output 被拒绝，repo 外 output 允许。console `--help` PASS；installed seed-7 六方法 toy `TOY_MVP_PASS`，1.728s、43,974,656 B；installed preflight exit 2/`NO_GO`。wheel 是本次临时验证 artifact，不作为 tracked golden；R1 应从最终 branch commit 重新构建并记录自己的精确 digest。
+fresh wheel 被安装到一个有独立 commit 的 foreign Git consumer 下的 clean target。动态证据为：module 从 target 导入；identity 为 `package_version=0.4.1b0`、`worktree_status=INSTALLED_IMMUTABLE_CONTENT`、package Python tree digest `a0999de8ef9efececec3e2520a2dabe2cec365d1237cf309cdcc8aba1c6e40f9`，不等于 foreign HEAD。normal foreign worktree 被拒写；标准 bare repo 的 `core.bare=yes` 被 Git `config --bool` 正常识别并拒写；malformed boolean 与 config 不可读均 rc 128 并 fail closed；repo 外 output 允许。console `--help` PASS，installed seed-7 六方法 toy `TOY_MVP_PASS`，installed preflight exit 2/`NO_GO`。
+
+README 会进入 wheel METADATA，所以上述两个 wheel 是 code-freeze 动态证据，不冒充最终 doc-tip canonical binary。source-release doc commit 完成后，从其 `git archive` 构建的 canonical wheel 会把精确 SHA/size 写入 repo 外 release manifest，不再回写 README/报告，避免无穷自引用。
 
 ### 13.5 Production preflight 与 R1/R2 边界
 
-source code commit `5a3525e...` 的 `real-preflight` 两次运行均 exit 2/`NO_GO`，字节一致，SHA-256 为 `7692cd4394595fb8057ddba7b80acba2e6b2dac6d2dd11099ca90b88c71282b9`。required asset gates 仍为 actor authority、discounted per-step oracle、exact arbitrary-action behavior density；Raw 仍 `NO_GO_RAW_OPERATOR_AUTHORITY`。方法阻塞另列 `NO_GO_OPS_DS_DENSE_HESSIAN_PANEL` 与 `NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT`。缺 dataset 的 census 稳定返回 `NO_GO`/`DECLARED_ONLY`，没有 KeyError 或 truthy capability 升级。
+source working checkout `277c815/b00c3a` 的首次 `real-preflight` 为 `e18c5f3994371bb27902546bf35deb2727fd846a149972d873b6d5fdbe1b8c84`，其 identity 绑定 Git commit/tree，但当时报告 WIP 使 `worktree_status=DIRTY`，因此只作布局诊断，不冒充 clean artifact。隔离 Git clean clone 上的 code-freeze preflight 稳定 exit 2/`NO_GO`，SHA-256 为 `40c266e84ad6c5c2025c1df2abea64e43f5b576c82ffe996846d61c416a52747`，identity 为同一 commit/tree 且 `worktree_status=CLEAN`。无 `.git` archive 本身仅用于隔离 import/测试和 wheel 构建，不从 ambient editable metadata 声明发布身份。由该 archive 构建后 fresh-install 的 wheel，与 clean-checkout build 后 fresh-install 的 wheel，两者 preflight 字节一致，SHA-256 均为 `09ce0517736cdddbe6d085168eb894474012c4e5edf53b3b9416447453ba1e5a`，identity 绑定 package content digest。Git source 与 installed distribution 的身份字段不同，因此不宣称二者整份文件字节相等；它们的状态决策和六个 blocker 精确一致。required asset gates 仍为 actor authority、discounted per-step oracle、exact arbitrary-action behavior density；Raw 仍 `NO_GO_RAW_OPERATOR_AUTHORITY`；方法阻塞另列 `NO_GO_OPS_DS_DENSE_HESSIAN_PANEL` 与 `NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT`。缺 dataset 的 census 稳定返回 `NO_GO`/`DECLARED_ONLY`，没有 KeyError 或 truthy capability 升级。
 
-R0 没有修改服务器、没有 push、没有启动真实资产训练；根任务完成的服务器资源/认证检查保持只读。本轮也没有更改 main/v04b/bootstrap/v03 引用或冻结资产。结论限定为：source release 与 wheel/install smoke 通过，synthetic method-level MVP 可执行、可复现，production preflight 诚实 fail closed。它不是 B20/B22 official reproduction，也不满足完整 v0.4b plan DoD。R1 仅在交叉审计放行后进行三线同步；R2 仍必须先做 P0 live census，不能跳过 authority/density/oracle/Raw 缺口直接启动正式 smoke。
+R0 没有修改服务器、没有 push、没有启动真实资产训练；根任务完成的服务器资源/认证检查保持只读，目前只验证 HTTPS 可读，服务器写认证未验证，SSH public-key 路径已失败。本轮也没有更改 main/v04b/bootstrap/v03 引用或冻结资产。结论限定为：source release 与 wheel/install smoke 通过，synthetic method-level MVP 可执行、可复现，production preflight 诚实 fail closed。它不是 B20/B22 official reproduction，也不满足完整 v0.4b plan DoD。R1 仅在交叉审计放行后进行三线同步；R2 仍必须先做 P0 live census，不能跳过 authority/density/oracle/Raw 缺口直接启动正式 smoke。
