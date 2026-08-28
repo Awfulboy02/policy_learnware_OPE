@@ -882,6 +882,26 @@ def test_actor_authority_and_live_assets_fail_closed(
 
     other_fpo = tmp_path / "other-fpo"
     _git_repo(other_fpo, "playground/src/flow_policy/fpo.py")
+    (other_fpo / "playground/src/flow_policy/fpo.py").write_text(
+        "different frozen source\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(other_fpo), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(other_fpo),
+            "-c",
+            "user.name=OPE Test",
+            "-c",
+            "user.email=ope@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "different freeze",
+        ],
+        check=True,
+    )
     with pytest.raises(DataValidationError, match="HEAD differs"):
         FrozenFPOActor(
             fixture.authority,
