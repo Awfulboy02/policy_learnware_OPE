@@ -861,6 +861,7 @@ def run_real_smoke(
         "input_config_sha256": config_sha256,
         "path_free_config_sha256": normalized_config_sha256,
         "path_free_config": normalized_config,
+        "implementation": implementation,
     }
     lock_path = destination / "config.lock.json"
     if lock_path.exists():

@@ -620,10 +620,13 @@ def test_real_smoke_seals_three_methods_with_crn_and_resumes_without_reexecution
     monkeypatch.setattr(cli_module, "export_existing_log", fake_export)
     monkeypatch.setattr(cli_module, "export_reward_free_query", fake_query)
     monkeypatch.setattr(cli_module, "load_export", lambda *args, **kwargs: batch)
+    implementation_identity = {
+        "commit": "c" * 40,
+        "tree": "d" * 40,
+        "worktree_status": "CLEAN",
+    }
     monkeypatch.setattr(
-        cli_module,
-        "_implementation_identity",
-        lambda: {"commit": "c" * 40, "tree": "d" * 40, "worktree_status": "CLEAN"},
+        cli_module, "_implementation_identity", lambda: dict(implementation_identity)
     )
     monkeypatch.setattr(
         cli_module,
@@ -806,6 +809,15 @@ def test_real_smoke_seals_three_methods_with_crn_and_resumes_without_reexecution
         tmp_path / "run-a",
         expected_config_sha256=sha256_file(first_config),
     )
+    implementation_identity["commit"] = "e" * 40
+    with pytest.raises(GateClosed, match="resume config lock differs"):
+        run_real_smoke(
+            first_config,
+            tmp_path / "run-a",
+            expected_config_sha256=sha256_file(first_config),
+            resume=True,
+        )
+    implementation_identity["commit"] = "c" * 40
     first_run_path = tmp_path / "run-a" / "run.json"
     original_run_bytes = first_run_path.read_bytes()
     tampered_summary = json.loads(original_run_bytes)
