@@ -7,24 +7,33 @@ from dataclasses import dataclass
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 import json
+import multiprocessing
+import os
 from pathlib import Path
+import resource
 import subprocess
+import sys
 from time import perf_counter
+import tempfile
 import tomllib
-from typing import Any, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
 from .adapters import (
     FROZEN_V03_COMMIT,
     FROZEN_V03_TREE,
+    GateClosed,
     RAW_FIXTURE_METHOD_ID,
+    RAW_PROJECT_METHOD_ID,
     RAW_QUERY_SCHEMA,
     RAW_REQUEST_SCHEMA,
     RAW_RESPONSE_SCHEMA,
+    RAW_SCORE_SEMANTICS,
     RawDeltaTask5Adapter,
     SealedRawOperator,
     census_real_assets,
+    execute_frozen_raw_query,
     sha256_file,
 )
 from .benchmark import (
@@ -36,6 +45,7 @@ from .benchmark import (
     seal_ranking,
 )
 from .core import (
+    DataValidationError,
     EstimateStatus,
     PolicySemantics,
     TransitionBatch,
@@ -49,6 +59,13 @@ from .mbope import (
     ETM_MBOPE_ID,
     make_model_based_estimator,
 )
+from .real import (
+    ActorAuthority,
+    FrozenFPOActor,
+    export_existing_log,
+    export_reward_free_query,
+    load_export,
+)
 
 
 TOY_CONTEXT = "synthetic_linear_native_time_v1"
@@ -56,6 +73,9 @@ TOY_HORIZON = 5
 TOY_GAMMA = 0.99
 TOY_VALUE_CONVENTION = finite_horizon_value_convention(TOY_GAMMA, TOY_HORIZON)
 V04B_PLAN_SHA256 = "5fb35cc2ee4c27afd411f77f0c2813088b6d6ab901f8910f442ed5b231e1719e"
+REAL_SMOKE_CONFIG_SCHEMA = "policy-learnware.ope.real-smoke-config.v1"
+REAL_SMOKE_STAGE_SCHEMA = "policy-learnware.ope.real-smoke-stage.v1"
+REAL_SMOKE_RUN_SCHEMA = "policy-learnware.ope.real-smoke-run.v1"
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -74,24 +94,24 @@ def _payload_digest(payload: Any) -> str:
     return sha256(_canonical_bytes(payload)).hexdigest()
 
 
-def _candidate_keys(
+def _common_random_keys(
     *,
     seed: int,
     method_id: str,
-    candidate_id: str,
+    context_id: str,
     phase: str,
     rows: int,
 ) -> np.ndarray:
-    """Derive row keys from stable identities, never candidate list position."""
+    """Derive one candidate-independent CRN panel from frozen identities."""
 
     root = int.from_bytes(
         sha256(
             _canonical_bytes(
                 {
-                    "schema": "policy-learnware.candidate-key.v1",
+                    "schema": "policy-learnware.common-random-key.v1",
                     "seed": seed,
                     "method_id": method_id,
-                    "candidate_id": candidate_id,
+                    "context_id": context_id,
                     "phase": phase,
                 }
             )
@@ -396,11 +416,11 @@ def _toy_oracle(
         state = initial_states.copy()
         discount = 1.0
         for native_t in range(TOY_HORIZON):
-            keys = _candidate_keys(
+            keys = _common_random_keys(
                 seed=seed,
                 method_id="TOY_ORACLE_AFTER_SEAL",
-                candidate_id=candidate.policy_id,
-                phase=f"timestep-{native_t}",
+                context_id=TOY_CONTEXT,
+                phase=f"oracle_rollout_t{native_t}",
                 rows=len(state),
             )
             action = candidate.sample_actions(
@@ -457,6 +477,1016 @@ def _stable_estimate(estimate: ValueEstimate) -> dict[str, Any]:
     stable_cost["timing_artifact"] = "runtime.json"
     payload["cost"] = stable_cost
     return payload
+
+
+def _real_smoke_exact_keys(
+    value: Any, expected: set[str], where: str
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise GateClosed(
+            "NO_GO_REAL_SMOKE_CONFIG",
+            f"{where} fields differ from the real-smoke schema",
+        )
+    return value
+
+
+def _real_smoke_digest(value: Any, where: str) -> str:
+    text = str(value)
+    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", f"{where} must be SHA-256")
+    return text
+
+
+def _read_real_smoke_config(
+    path: str | Path, expected_sha256: str
+) -> tuple[dict[str, Any], str]:
+    expected_sha256 = _real_smoke_digest(expected_sha256, "config digest")
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "config is unreadable") from exc
+    if sha256(raw).hexdigest() != expected_sha256:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "config digest mismatch")
+    try:
+        config = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "config is not JSON") from exc
+    config = dict(
+        _real_smoke_exact_keys(
+            config,
+            {"schema", "protocol", "dataset", "actors", "raw", "fqe", "mbff"},
+            "config",
+        )
+    )
+    if config["schema"] != REAL_SMOKE_CONFIG_SCHEMA:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "config schema differs")
+    protocol = _real_smoke_exact_keys(
+        config["protocol"],
+        {
+            "context_id",
+            "task_id",
+            "seed",
+            "gamma",
+            "horizon",
+            "budget",
+            "split_seed",
+            "track",
+        },
+        "protocol",
+    )
+    if (
+        not isinstance(protocol["context_id"], str)
+        or not protocol["context_id"]
+        or not isinstance(protocol["task_id"], str)
+        or not protocol["task_id"]
+        or isinstance(protocol["seed"], bool)
+        or protocol["seed"] != 1
+        or protocol["gamma"] != 0.99
+        or protocol["horizon"] != 1000
+        or protocol["budget"] != 24
+        or protocol["split_seed"] != 40401
+        or protocol["track"] != "development"
+    ):
+        raise GateClosed(
+            "NO_GO_REAL_SMOKE_CONFIG", "protocol differs from the frozen B24 smoke"
+        )
+    dataset = _real_smoke_exact_keys(
+        config["dataset"], {"p0_census_path", "p0_census_sha256", "bank_path"}, "dataset"
+    )
+    _real_smoke_digest(dataset["p0_census_sha256"], "P0 census digest")
+    actors = _real_smoke_exact_keys(
+        config["actors"],
+        {"fpo_checkout", "policy_repo_checkout", "candidates"},
+        "actors",
+    )
+    candidates = actors["candidates"]
+    if not isinstance(candidates, Mapping) or len(candidates) != 5:
+        raise GateClosed(
+            "NO_GO_REAL_SMOKE_CONFIG", "actors must contain exactly five candidates"
+        )
+    for candidate_id, record in candidates.items():
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "candidate ID is invalid")
+        record = _real_smoke_exact_keys(
+            record,
+            {"authority_path", "authority_sha256", "bundle_dir"},
+            f"actor {candidate_id}",
+        )
+        _real_smoke_digest(record["authority_sha256"], f"actor {candidate_id} authority")
+    raw_config = _real_smoke_exact_keys(
+        config["raw"],
+        {
+            "authority_path",
+            "authority_sha256",
+            "repo_root",
+            "raw_view_root",
+            "asset_census_path",
+            "raw_adapter_path",
+            "block_size",
+        },
+        "raw",
+    )
+    _real_smoke_digest(raw_config["authority_sha256"], "Raw authority digest")
+    if raw_config["block_size"] != 2048:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "Raw block_size is frozen at 2048")
+    _real_smoke_exact_keys(
+        config["fqe"],
+        {"ridge", "max_iterations", "tolerance", "stochastic_action_samples"},
+        "fqe",
+    )
+    mbff = _real_smoke_exact_keys(
+        config["mbff"],
+        {
+            "ridge",
+            "rollouts_per_initial",
+            "ensemble_members",
+            "hidden_dim",
+            "termination_mode",
+        },
+        "mbff",
+    )
+    if mbff["termination_mode"] != "horizon_only":
+        raise GateClosed(
+            "NO_GO_REAL_SMOKE_CONFIG", "smoke MB-FF requires horizon_only termination"
+        )
+    return config, expected_sha256
+
+
+def _real_smoke_p0_identity(
+    config: Mapping[str, Any]
+) -> tuple[list[str], str, dict[str, Any]]:
+    dataset = config["dataset"]
+    census_path = Path(dataset["p0_census_path"])
+    expected = dataset["p0_census_sha256"]
+    if sha256_file(census_path) != expected:
+        raise GateClosed("NO_GO_ASSET_ABI", "P0 census digest mismatch")
+    try:
+        census = json.loads(census_path.read_text(encoding="utf-8"))
+        protocol = config["protocol"]
+        candidate_set = census["freeze"]["candidate_sets"][protocol["task_id"]]
+        candidate_ids = candidate_set["candidate_ids"]
+        membership = census["freeze"]["memberships"][protocol["context_id"]]
+        smoke = census["freeze"]["smoke"]
+        smoke_context = smoke["contexts"][protocol["task_id"]]
+        bank_rows = census["asset_facts"]["banks"]["full_rows"]
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise GateClosed("NO_GO_ASSET_ABI", "P0 census lacks smoke identity") from exc
+    if (
+        census.get("schema") != "policy-learnware.ope.p0-live-census.v1"
+        or not isinstance(candidate_ids, list)
+        or len(candidate_ids) != 5
+        or candidate_ids != sorted(set(candidate_ids))
+        or set(candidate_ids) != set(config["actors"]["candidates"])
+        or membership.get("task_id") != protocol["task_id"]
+    ):
+        raise GateClosed("NO_GO_ASSET_ABI", "P0 TASK_5/context binding differs")
+    matches = [
+        row
+        for row in bank_rows
+        if row.get("context_id") == protocol["context_id"]
+    ]
+    if (
+        len(matches) != 1
+        or matches[0].get("task_id") != protocol["task_id"]
+        or matches[0].get("role") != "development_query"
+        or matches[0].get("status") != "PASS"
+    ):
+        raise GateClosed("NO_GO_ASSET_ABI", "P0 bank/context binding differs")
+    bank = matches[0]
+    if (
+        smoke.get("budget_episodes") != 24
+        or smoke.get("seed") != 1
+        or smoke.get("status") != "NO_GO_PRE_ORACLE_SMOKE_BRIDGES_MISSING"
+        or smoke_context.get("context_id") != protocol["context_id"]
+        or smoke_context.get("dataset_digest") != bank.get("dataset_digest")
+        or smoke_context.get("candidate_membership_digest")
+        != candidate_set.get("membership_digest")
+        or smoke_context.get("fit_membership_digest")
+        != membership.get("fit_membership_digest")
+        or smoke_context.get("validation_membership_digest")
+        != membership.get("validation_membership_digest")
+        or smoke_context.get("s0_membership_digest")
+        != membership.get("s0_membership_digest")
+        or set(smoke_context.get("methods", ()))
+        != {
+            "RAW_DELTA_TASK5",
+            "FH_FQE_G099_H1000",
+            "DOPE_STYLE_MB_FF_G099_H1000",
+        }
+    ):
+        raise GateClosed("NO_GO_ASSET_ABI", "P0 frozen smoke cell differs")
+    return list(candidate_ids), str(matches[0]["bank_sha256"]), dict(membership)
+
+
+def _peak_rss_bytes() -> int:
+    rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return rss if sys.platform == "darwin" else rss * 1024
+
+
+def _real_smoke_stage(
+    root: Path,
+    name: str,
+    *,
+    config_sha256: str,
+    resume: bool,
+    build: Callable[[Path], dict[str, Any]],
+) -> dict[str, Any]:
+    destination = root / name
+    if destination.exists():
+        if not resume:
+            raise FileExistsError(f"real-smoke stage already exists: {destination}")
+        try:
+            stage = json.loads((destination / "stage.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise GateClosed("NO_GO_ASSET_ABI", f"{name} stage is unreadable") from exc
+        if (
+            not isinstance(stage, Mapping)
+            or stage.get("schema") != REAL_SMOKE_STAGE_SCHEMA
+            or stage.get("stage") != name
+            or stage.get("config_sha256") != config_sha256
+            or not isinstance(stage.get("artifacts"), Mapping)
+        ):
+            raise GateClosed("NO_GO_ASSET_ABI", f"{name} stage identity mismatch")
+        for relative, digest in stage["artifacts"].items():
+            artifact = destination / str(relative)
+            if (
+                Path(str(relative)).is_absolute()
+                or ".." in Path(str(relative)).parts
+                or artifact.is_symlink()
+                or not artifact.is_file()
+                or sha256_file(artifact) != digest
+            ):
+                raise GateClosed("NO_GO_ASSET_ABI", f"{name} stage artifact mismatch")
+        return dict(stage)
+
+    temporary = Path(tempfile.mkdtemp(prefix=f".{name}.partial-", dir=root))
+    payload = build(temporary)
+    if "artifacts" not in payload or not isinstance(payload["artifacts"], Mapping):
+        raise RuntimeError(f"{name} stage builder omitted artifacts")
+    stage = {
+        "schema": REAL_SMOKE_STAGE_SCHEMA,
+        "stage": name,
+        "config_sha256": config_sha256,
+        **payload,
+    }
+    _write_canonical_json(temporary / "stage.json", stage)
+    os.rename(temporary, destination)
+    return stage
+
+
+def _raw_subprocess_entry(
+    arguments: dict[str, Any], sender: Any
+) -> None:  # pragma: no cover - exercised through the parent boundary
+    try:
+        sys.dont_write_bytecode = True
+        sender.send({"ok": True, "response": execute_frozen_raw_query(**arguments)})
+    except Exception as exc:
+        sender.send(
+            {
+                "ok": False,
+                "status": getattr(exc, "status", "NO_GO_RAW_PARITY"),
+                "detail": str(exc),
+                "exception_type": type(exc).__name__,
+            }
+        )
+    finally:
+        sender.close()
+
+
+def _execute_raw_isolated(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Run the frozen Raw checkout in a clean interpreter, away from actor imports."""
+
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_raw_subprocess_entry, args=(arguments, sender))
+    process.start()
+    sender.close()
+    process.join(timeout=1800)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        raise GateClosed("NO_GO_RAW_PARITY", "isolated Raw execution timed out")
+    try:
+        result = receiver.recv()
+    except EOFError as exc:
+        raise GateClosed(
+            "NO_GO_RAW_PARITY",
+            f"isolated Raw execution exited without evidence (rc={process.exitcode})",
+        ) from exc
+    finally:
+        receiver.close()
+    if process.exitcode != 0 or not isinstance(result, Mapping) or not result.get("ok"):
+        raise GateClosed(
+            str(result.get("status", "NO_GO_RAW_PARITY"))
+            if isinstance(result, Mapping)
+            else "NO_GO_RAW_PARITY",
+            str(result.get("detail", "isolated Raw execution failed"))
+            if isinstance(result, Mapping)
+            else "isolated Raw execution failed",
+        )
+    response = result.get("response")
+    if not isinstance(response, Mapping):
+        raise GateClosed("NO_GO_RAW_PARITY", "isolated Raw response is malformed")
+    return dict(response)
+
+
+def run_real_smoke(
+    config_path: str | Path,
+    output: str | Path,
+    *,
+    expected_config_sha256: str,
+    resume: bool = False,
+) -> dict[str, Any]:
+    """Run Raw + FQE + MB-FF and stop after oracle-blind ranking seals."""
+
+    config, config_sha256 = _read_real_smoke_config(
+        config_path, expected_config_sha256
+    )
+    candidate_ids, bank_sha256, frozen_membership = _real_smoke_p0_identity(config)
+    protocol = config["protocol"]
+    actors_config = config["actors"]
+    raw_config = config["raw"]
+    implementation = _implementation_identity()
+    if implementation["worktree_status"] not in {
+        "CLEAN",
+        "INSTALLED_IMMUTABLE_CONTENT",
+    }:
+        raise GateClosed(
+            "NO_GO_IMPLEMENTATION_IDENTITY",
+            "real smoke requires a clean checkout or immutable installed package",
+        )
+    normalized_config = {
+        "schema": "policy-learnware.ope.real-smoke-path-free-config.v1",
+        "protocol": dict(protocol),
+        "protocol_correction": {
+            "planning_text_semantics": "DETERMINISTIC_DEPLOYMENT",
+            "frozen_asset_semantics": "PER_STEP_STOCHASTIC_KEYED",
+            "deterministic_true_effect": "FEATHER_NOISE_DISABLED_ACTION_STILL_PRNG_SAMPLED",
+            "fqe_mb_policy_expectation": "COMMON_RANDOM_KEYED_MONTE_CARLO",
+            "kmifqe_existing_fpo_status": "NO_GO_TARGET_POLICY_SEMANTICS",
+        },
+        "dataset": {
+            "p0_census_sha256": config["dataset"]["p0_census_sha256"],
+            "bank_sha256": bank_sha256,
+            "membership_protocol": "ope-existing-log-membership-v1",
+        },
+        "candidate_ids": candidate_ids,
+        "candidate_set_sha256": candidate_set_digest(candidate_ids),
+        "actor_authority_sha256": {
+            candidate_id: actors_config["candidates"][candidate_id][
+                "authority_sha256"
+            ]
+            for candidate_id in candidate_ids
+        },
+        "raw": {
+            "authority_sha256": raw_config["authority_sha256"],
+            "block_size": raw_config["block_size"],
+            "score_semantics": RAW_SCORE_SEMANTICS,
+        },
+        "fqe": dict(config["fqe"]),
+        "mbff": dict(config["mbff"]),
+    }
+    normalized_config_sha256 = _payload_digest(normalized_config)
+    destination = _guard_output_location(output)
+    if destination.exists() and not destination.is_dir():
+        raise FileExistsError(f"real-smoke output is not a directory: {destination}")
+    if destination.exists() and any(destination.iterdir()) and not resume:
+        raise FileExistsError(
+            f"real-smoke output is non-empty; pass --resume to verify it: {destination}"
+        )
+    destination.mkdir(parents=True, exist_ok=True)
+    lock = {
+        "schema": "policy-learnware.ope.real-smoke-config-lock.v1",
+        "input_config_sha256": config_sha256,
+        "path_free_config_sha256": normalized_config_sha256,
+        "path_free_config": normalized_config,
+    }
+    lock_path = destination / "config.lock.json"
+    if lock_path.exists():
+        if lock_path.read_bytes() != _canonical_bytes(lock):
+            raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "resume config lock differs")
+    else:
+        _write_canonical_json(lock_path, lock)
+
+    final_path = destination / "run.json"
+    if final_path.exists():
+        if not resume:
+            raise FileExistsError(f"real-smoke run already exists: {final_path}")
+        try:
+            final = json.loads(final_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise GateClosed("NO_GO_ASSET_ABI", "existing run artifact is unreadable") from exc
+        if (
+            final.get("schema") != REAL_SMOKE_RUN_SCHEMA
+            or final.get("config_sha256") != config_sha256
+            or final.get("path_free_config_sha256") != normalized_config_sha256
+        ):
+            raise GateClosed("NO_GO_ASSET_ABI", "existing run identity mismatch")
+        stage_references = final.get("stages")
+        if not isinstance(stage_references, Mapping) or set(stage_references) != {
+            "data",
+            "raw",
+            "fqe",
+            "mbff",
+        }:
+            raise GateClosed("NO_GO_ASSET_ABI", "existing run stage inventory differs")
+        verified_stages: dict[str, dict[str, Any]] = {}
+        for stage_name in ("data", "raw", "fqe", "mbff"):
+            if not (destination / stage_name).is_dir():
+                raise GateClosed("NO_GO_ASSET_ABI", f"{stage_name} stage is absent")
+            verified_stages[stage_name] = _real_smoke_stage(
+                destination,
+                stage_name,
+                config_sha256=config_sha256,
+                resume=True,
+                build=lambda _path: {},
+            )
+            reference = stage_references[stage_name]
+            expected_path = f"{stage_name}/stage.json"
+            if (
+                not isinstance(reference, Mapping)
+                or reference.get("path") != expected_path
+                or sha256_file(destination / expected_path) != reference.get("sha256")
+            ):
+                raise GateClosed("NO_GO_ASSET_ABI", f"{stage_name} stage seal differs")
+        for reference in final.get("ranking_seals", {}).values():
+            seal_path = destination / reference["path"]
+            if sha256_file(seal_path) != reference["sha256"]:
+                raise GateClosed("NO_GO_ASSET_ABI", "existing ranking seal mismatch")
+        runtime_reference = final.get("runtime")
+        runtime_path = destination / "runtime.json"
+        if (
+            not isinstance(runtime_reference, Mapping)
+            or runtime_reference.get("path") != "runtime.json"
+            or runtime_path.is_symlink()
+            or not runtime_path.is_file()
+            or sha256_file(runtime_path) != runtime_reference.get("sha256")
+        ):
+            raise GateClosed("NO_GO_ASSET_ABI", "existing run runtime differs")
+        try:
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise GateClosed("NO_GO_ASSET_ABI", "existing runtime is unreadable") from exc
+        expected_runtime_artifacts = {
+            name: stage["artifacts"]["runtime.json"]
+            for name, stage in verified_stages.items()
+        }
+        if (
+            runtime.get("schema") != "policy-learnware.ope.real-smoke-runtime.v1"
+            or runtime.get("stage") != "run"
+            or runtime.get("config_sha256") != config_sha256
+            or runtime.get("path_free_config_sha256") != normalized_config_sha256
+            or runtime.get("stage_runtime_artifacts") != expected_runtime_artifacts
+            or final.get("shared_setup", {}).get("actor_count")
+            != runtime.get("actor_count")
+            or final.get("shared_setup", {}).get("actor_setup_wall_seconds")
+            != runtime.get("actor_setup_wall_seconds")
+            or final.get("shared_setup", {}).get("actor_setup_peak_rss_bytes")
+            != runtime.get("actor_setup_peak_rss_bytes")
+        ):
+            raise GateClosed("NO_GO_ASSET_ABI", "existing runtime identity differs")
+        for candidate_id in candidate_ids:
+            record = actors_config["candidates"][candidate_id]
+            authority = ActorAuthority.from_json(
+                record["authority_path"],
+                expected_sha256=record["authority_sha256"],
+                census_path=config["dataset"]["p0_census_path"],
+                expected_census_sha256=config["dataset"]["p0_census_sha256"],
+                context_id=protocol["context_id"],
+                candidate_id=candidate_id,
+            )
+            evidence = final.get("actor_evidence", {}).get(candidate_id, {})
+            if (
+                evidence.get("authority_sha256") != authority.authority_sha256
+                or evidence.get("bundle_digest") != authority.bundle_digest
+            ):
+                raise GateClosed("NO_GO_ACTOR_AUTHORITY", "existing actor evidence differs")
+        return final
+
+    invocation_started = perf_counter()
+
+    def build_data(stage_dir: Path) -> dict[str, Any]:
+        started = perf_counter()
+        exported = export_existing_log(
+            config["dataset"]["p0_census_path"],
+            expected_census_sha256=config["dataset"]["p0_census_sha256"],
+            context_id=protocol["context_id"],
+            bank_path=config["dataset"]["bank_path"],
+            output_dir=stage_dir / "transitions",
+        )
+        manifest = exported["manifest"]
+        if (
+            manifest["context"]["context_id"] != protocol["context_id"]
+            or manifest["context"]["task_id"] != protocol["task_id"]
+            or manifest["source"]["bank_sha256"] != bank_sha256
+            or manifest["membership_protocol"]["fit_episode_count"] != 24
+            or manifest["membership_protocol"]["fit_rows_per_episode"] != 64
+            or manifest["membership_protocol"]["split_seed"] != 40401
+        ):
+            raise GateClosed("NO_GO_ASSET_ABI", "exported smoke identity differs")
+        query = export_reward_free_query(
+            stage_dir / "transitions",
+            expected_manifest_sha256=exported["manifest_sha256"],
+            output_path=stage_dir / "raw-query.npz",
+        )
+        runtime = {
+            "schema": "policy-learnware.ope.real-smoke-runtime.v1",
+            "stage": "data",
+            "wall_seconds": perf_counter() - started,
+            "peak_rss_bytes": _peak_rss_bytes(),
+        }
+        _write_canonical_json(stage_dir / "runtime.json", runtime)
+        return {
+            "artifacts": {
+                "raw-query.npz": query["artifact_sha256"],
+                "runtime.json": sha256_file(stage_dir / "runtime.json"),
+                **{
+                    f"transitions/{split}.npz": manifest["splits"][split][
+                        "file_sha256"
+                    ]
+                    for split in ("fit", "validation", "s0")
+                },
+                "transitions/manifest.json": exported["manifest_sha256"],
+            },
+            "bank_sha256": bank_sha256,
+            "export_manifest_sha256": exported["manifest_sha256"],
+            "fit_membership_sha256": manifest["splits"]["fit"][
+                "membership_digest"
+            ],
+            "validation_membership_sha256": manifest["splits"]["validation"][
+                "membership_digest"
+            ],
+            "s0_membership_sha256": manifest["splits"]["s0"][
+                "membership_digest"
+            ],
+            "query_sha256": query["artifact_sha256"],
+            "transition_count": query["transition_count"],
+        }
+
+    data_stage = _real_smoke_stage(
+        destination,
+        "data",
+        config_sha256=config_sha256,
+        resume=resume,
+        build=build_data,
+    )
+    if (
+        data_stage["fit_membership_sha256"]
+        != frozen_membership.get("fit_membership_digest")
+        or data_stage["validation_membership_sha256"]
+        != frozen_membership.get("validation_membership_digest")
+        or data_stage["s0_membership_sha256"]
+        != frozen_membership.get("s0_membership_digest")
+    ):
+        raise GateClosed("NO_GO_ASSET_ABI", "P0/export memberships differ")
+
+    value_convention = finite_horizon_value_convention(
+        protocol["gamma"], protocol["horizon"]
+    )
+    candidate_tasks = {candidate_id: protocol["task_id"] for candidate_id in candidate_ids}
+    common_provenance = {
+        "seed": protocol["seed"],
+        "implementation_commit": implementation["commit"],
+        "implementation_tree": implementation["tree"],
+        "implementation_worktree_status": implementation["worktree_status"],
+        "config_sha256": config_sha256,
+        "path_free_config_sha256": normalized_config_sha256,
+        "p0_census_sha256": config["dataset"]["p0_census_sha256"],
+        "bank_sha256": bank_sha256,
+        "export_manifest_sha256": data_stage["export_manifest_sha256"],
+        "fit_membership_sha256": data_stage["fit_membership_sha256"],
+        "candidate_set_sha256": candidate_set_digest(candidate_ids),
+        "actor_authority_sha256": normalized_config["actor_authority_sha256"],
+        "gamma": protocol["gamma"],
+        "horizon": protocol["horizon"],
+        "stage": "PRE_JOIN_SEALED",
+        "development_only": True,
+    }
+
+    def build_raw(stage_dir: Path) -> dict[str, Any]:
+        started = perf_counter()
+        placeholder = SealedRawOperator(
+            stage_dir / "response.json",
+            "0" * 64,
+            expected_authority_digest=raw_config["authority_sha256"],
+        )
+        request = RawDeltaTask5Adapter(
+            placeholder, method_id=RAW_PROJECT_METHOD_ID
+        ).request(
+            context_id=protocol["context_id"],
+            task_id=protocol["task_id"],
+            candidate_tasks=candidate_tasks,
+            query_artifact_digest=data_stage["query_sha256"],
+            membership_digest=data_stage["fit_membership_sha256"],
+        )
+        response = _execute_raw_isolated(
+            {
+                "authority_path": raw_config["authority_path"],
+                "expected_authority_sha256": raw_config["authority_sha256"],
+                "repo_root": raw_config["repo_root"],
+                "raw_view_root": raw_config["raw_view_root"],
+                "asset_census_path": raw_config["asset_census_path"],
+                "raw_adapter_path": raw_config["raw_adapter_path"],
+                "query_path": destination / "data" / "raw-query.npz",
+                "expected_query_sha256": data_stage["query_sha256"],
+                "request": request,
+                "block_size": raw_config["block_size"],
+            }
+        )
+        if response.get("score_semantics") != RAW_SCORE_SEMANTICS:
+            raise GateClosed("NO_GO_RAW_PARITY", "isolated Raw semantics differ")
+        _write_canonical_json(stage_dir / "response.json", response)
+        response_sha256 = sha256_file(stage_dir / "response.json")
+        adapter = RawDeltaTask5Adapter(
+            SealedRawOperator(
+                stage_dir / "response.json",
+                response_sha256,
+                expected_authority_digest=raw_config["authority_sha256"],
+            ),
+            method_id=RAW_PROJECT_METHOD_ID,
+        )
+        scores = adapter.score(
+            context_id=protocol["context_id"],
+            task_id=protocol["task_id"],
+            candidate_tasks=candidate_tasks,
+            query_artifact_digest=data_stage["query_sha256"],
+            membership_digest=data_stage["fit_membership_sha256"],
+        )
+        _write_canonical_json(stage_dir / "scores.json", scores)
+        seal = seal_ranking(
+            stage_dir / "ranking.seal.json",
+            method_id=RAW_PROJECT_METHOD_ID,
+            context_id=protocol["context_id"],
+            score_kind="compatibility",
+            scores=scores,
+            diagnostics={
+                candidate_id: {"score_semantics": RAW_SCORE_SEMANTICS}
+                for candidate_id in candidate_ids
+            },
+            provenance={
+                **common_provenance,
+                "scientific_role": "PROJECT_RAW_DELTA_TASK5_ADAPTER",
+                "query_sha256": data_stage["query_sha256"],
+                "response_sha256": response_sha256,
+                "raw_authority_sha256": raw_config["authority_sha256"],
+                "score_semantics": RAW_SCORE_SEMANTICS,
+                "official_paper_parity": False,
+            },
+            higher_is_better=True,
+            value_convention=value_convention,
+        )
+        runtime = {
+            "schema": "policy-learnware.ope.real-smoke-runtime.v1",
+            "stage": "raw",
+            "wall_seconds": perf_counter() - started,
+            "peak_rss_bytes": _peak_rss_bytes(),
+        }
+        _write_canonical_json(stage_dir / "runtime.json", runtime)
+        return {
+            "artifacts": {
+                "ranking.seal.json": seal.digest,
+                "response.json": response_sha256,
+                "runtime.json": sha256_file(stage_dir / "runtime.json"),
+                "scores.json": sha256_file(stage_dir / "scores.json"),
+            },
+            "method_id": RAW_PROJECT_METHOD_ID,
+            "ranking": list(seal.payload["ranking"]),
+            "selected_candidate_id": seal.payload["selected_candidate_id"],
+            "seal_sha256": seal.digest,
+            "status": "PASS",
+        }
+
+    raw_stage = _real_smoke_stage(
+        destination,
+        "raw",
+        config_sha256=config_sha256,
+        resume=resume,
+        build=build_raw,
+    )
+
+    actor_setup_started = perf_counter()
+    actors: dict[str, FrozenFPOActor] = {}
+    for candidate_id in candidate_ids:
+        record = actors_config["candidates"][candidate_id]
+        authority = ActorAuthority.from_json(
+            record["authority_path"],
+            expected_sha256=record["authority_sha256"],
+            census_path=config["dataset"]["p0_census_path"],
+            expected_census_sha256=config["dataset"]["p0_census_sha256"],
+            context_id=protocol["context_id"],
+            candidate_id=candidate_id,
+        )
+        if authority.task_id != protocol["task_id"]:
+            raise GateClosed("NO_GO_ACTOR_AUTHORITY", "actor task differs")
+        actors[candidate_id] = FrozenFPOActor(
+            authority,
+            bundle_dir=record["bundle_dir"],
+            fpo_checkout=actors_config["fpo_checkout"],
+            policy_repo_checkout=actors_config["policy_repo_checkout"],
+        )
+    actor_setup_wall_seconds = perf_counter() - actor_setup_started
+    actor_setup_peak_rss_bytes = _peak_rss_bytes()
+
+    fit_batch = load_export(
+        destination / "data" / "transitions",
+        "fit",
+        expected_manifest_sha256=data_stage["export_manifest_sha256"],
+    )
+    s0_batch = load_export(
+        destination / "data" / "transitions",
+        "s0",
+        expected_manifest_sha256=data_stage["export_manifest_sha256"],
+    )
+
+    def build_value_stage(
+        stage_dir: Path,
+        *,
+        family: str,
+    ) -> dict[str, Any]:
+        started = perf_counter()
+        estimates: dict[str, ValueEstimate] = {}
+        if family == "fqe":
+            method_id: str | None = None
+            for candidate_id in candidate_ids:
+                estimator = FiniteHorizonFQE(
+                    gamma=protocol["gamma"],
+                    horizon=protocol["horizon"],
+                    **config["fqe"],
+                )
+                method_id = estimator.method_id if method_id is None else method_id
+                if estimator.method_id != method_id:
+                    raise RuntimeError("FQE method identity changed across candidates")
+                estimator.fit(
+                    fit_batch,
+                    actors[candidate_id],
+                    fit_keys=_common_random_keys(
+                        seed=protocol["seed"],
+                        method_id=estimator.method_id,
+                        context_id=protocol["context_id"],
+                        phase="fit_transition_rows",
+                        rows=len(fit_batch),
+                    ),
+                )
+                estimates[candidate_id] = estimator.estimate(
+                    s0_batch.observation,
+                    initial_timestep=s0_batch.native_timestep,
+                    keys=_common_random_keys(
+                        seed=protocol["seed"],
+                        method_id=estimator.method_id,
+                        context_id=protocol["context_id"],
+                        phase="estimate_s0_rows",
+                        rows=len(s0_batch),
+                    ),
+                )
+            scientific_role = "FINITE_HORIZON_PROTOCOL_ADAPTATION"
+        else:
+            estimator = make_model_based_estimator(
+                DOPE_STYLE_MB_FF_ID,
+                gamma=protocol["gamma"],
+                horizon=protocol["horizon"],
+                **{
+                    key: value
+                    for key, value in config["mbff"].items()
+                    if key != "termination_mode"
+                },
+            )
+            method_id = estimator.method_id
+            estimator.fit(
+                fit_batch,
+                actors[candidate_ids[0]],
+                fit_keys=_common_random_keys(
+                    seed=protocol["seed"],
+                    method_id=method_id,
+                    context_id=protocol["context_id"],
+                    phase="transition_model_fit",
+                    rows=1,
+                ),
+            )
+            for candidate_id in candidate_ids:
+                estimates[candidate_id] = estimator.estimate(
+                    s0_batch.observation,
+                    initial_timestep=s0_batch.native_timestep,
+                    keys=_common_random_keys(
+                        seed=protocol["seed"],
+                        method_id=method_id,
+                        context_id=protocol["context_id"],
+                        phase="estimate_s0_rows",
+                        rows=len(s0_batch),
+                    ),
+                    candidate=actors[candidate_id],
+                )
+            scientific_role = "PROJECT_DEFINED_REFERENCE"
+        assert method_id is not None
+        stable = {
+            candidate_id: _stable_estimate(estimates[candidate_id])
+            for candidate_id in candidate_ids
+        }
+        _write_canonical_json(stage_dir / "estimates.json", stable)
+        scores = {
+            candidate_id: estimates[candidate_id].value for candidate_id in candidate_ids
+        }
+        statuses = {
+            candidate_id: estimates[candidate_id].status.value
+            for candidate_id in candidate_ids
+        }
+        diagnostics = {
+            candidate_id: {
+                **stable[candidate_id]["support"],
+                **stable[candidate_id]["diagnostics"],
+            }
+            for candidate_id in candidate_ids
+        }
+        seal = seal_ranking(
+            stage_dir / "ranking.seal.json",
+            method_id=method_id,
+            context_id=protocol["context_id"],
+            score_kind="value",
+            scores=scores,
+            statuses=statuses,
+            diagnostics=diagnostics,
+            provenance={
+                **common_provenance,
+                "scientific_role": scientific_role,
+                "s0_membership_sha256": data_stage["s0_membership_sha256"],
+                "policy_semantics": "STOCHASTIC_KEYED_MONTE_CARLO_EXPECTATION",
+                "candidate_independent_common_random_panel": True,
+                "official_paper_parity": False,
+            },
+            higher_is_better=True,
+            value_convention=value_convention,
+        )
+        runtime = {
+            "schema": "policy-learnware.ope.real-smoke-runtime.v1",
+            "stage": family,
+            "wall_seconds": perf_counter() - started,
+            "peak_rss_bytes": _peak_rss_bytes(),
+        }
+        _write_canonical_json(stage_dir / "runtime.json", runtime)
+        all_pass = all(status == EstimateStatus.PASS.value for status in statuses.values())
+        return {
+            "all_candidates_pass": all_pass,
+            "artifacts": {
+                "estimates.json": sha256_file(stage_dir / "estimates.json"),
+                "ranking.seal.json": seal.digest,
+                "runtime.json": sha256_file(stage_dir / "runtime.json"),
+            },
+            "method_id": method_id,
+            "ranking": list(seal.payload["ranking"]),
+            "selected_candidate_id": seal.payload["selected_candidate_id"],
+            "seal_sha256": seal.digest,
+            "statuses": statuses,
+        }
+
+    fqe_stage = _real_smoke_stage(
+        destination,
+        "fqe",
+        config_sha256=config_sha256,
+        resume=resume,
+        build=lambda stage_dir: build_value_stage(stage_dir, family="fqe"),
+    )
+    mbff_stage = _real_smoke_stage(
+        destination,
+        "mbff",
+        config_sha256=config_sha256,
+        resume=resume,
+        build=lambda stage_dir: build_value_stage(stage_dir, family="mbff"),
+    )
+
+    actor_evidence = {
+        candidate_id: {
+            "authority_sha256": actors[candidate_id].authority.authority_sha256,
+            "bundle_digest": actors[candidate_id].authority.bundle_digest,
+            "semantics": actors[candidate_id].semantics.value,
+            "initialization_parity_status": actors[candidate_id].parity["status"],
+            "same_key_replay_status": actors[candidate_id].parity[
+                "same_key_replay"
+            ]["status"],
+            "different_key_sensitivity_status": actors[candidate_id].parity[
+                "different_key_sensitivity"
+            ]["status"],
+            "final_read_only_verification": dict(actors[candidate_id].verify_unchanged()),
+        }
+        for candidate_id in candidate_ids
+    }
+    all_pass = bool(
+        raw_stage.get("status") == "PASS"
+        and fqe_stage.get("all_candidates_pass") is True
+        and mbff_stage.get("all_candidates_pass") is True
+    )
+    stage_runtime_artifacts = {
+        name: stage["artifacts"]["runtime.json"]
+        for name, stage in (
+            ("data", data_stage),
+            ("raw", raw_stage),
+            ("fqe", fqe_stage),
+            ("mbff", mbff_stage),
+        )
+    }
+    proposed_runtime = {
+        "schema": "policy-learnware.ope.real-smoke-runtime.v1",
+        "stage": "run",
+        "config_sha256": config_sha256,
+        "path_free_config_sha256": normalized_config_sha256,
+        "invocation_wall_seconds": perf_counter() - invocation_started,
+        "peak_rss_bytes": _peak_rss_bytes(),
+        "actor_count": len(actors),
+        "actor_setup_wall_seconds": actor_setup_wall_seconds,
+        "actor_setup_peak_rss_bytes": actor_setup_peak_rss_bytes,
+        "stage_runtime_artifacts": stage_runtime_artifacts,
+    }
+    runtime_path = destination / "runtime.json"
+    if runtime_path.exists():
+        if not resume or runtime_path.is_symlink() or not runtime_path.is_file():
+            raise FileExistsError(f"real-smoke runtime conflict: {runtime_path}")
+        try:
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise GateClosed("NO_GO_ASSET_ABI", "resume runtime is unreadable") from exc
+        if (
+            runtime.get("schema") != proposed_runtime["schema"]
+            or runtime.get("stage") != "run"
+            or runtime.get("config_sha256") != config_sha256
+            or runtime.get("path_free_config_sha256") != normalized_config_sha256
+            or runtime.get("actor_count") != len(actors)
+            or runtime.get("stage_runtime_artifacts") != stage_runtime_artifacts
+            or not isinstance(runtime.get("actor_setup_wall_seconds"), (int, float))
+        ):
+            raise GateClosed("NO_GO_ASSET_ABI", "resume runtime identity differs")
+    else:
+        runtime = proposed_runtime
+        _write_canonical_json(runtime_path, runtime)
+    run = {
+        "schema": REAL_SMOKE_RUN_SCHEMA,
+        "status": "SEALED_PRE_ORACLE" if all_pass else "INCOMPLETE_PRE_ORACLE",
+        "metrics_status": "WAITING_ORACLE" if all_pass else "NOT_READY",
+        "development_only": True,
+        "oracle_accessed": False,
+        "environment_accessed": False,
+        "config_sha256": config_sha256,
+        "path_free_config_sha256": normalized_config_sha256,
+        "implementation": implementation,
+        "context_id": protocol["context_id"],
+        "task_id": protocol["task_id"],
+        "seed": protocol["seed"],
+        "gamma": protocol["gamma"],
+        "horizon": protocol["horizon"],
+        "candidate_ids": candidate_ids,
+        "actor_evidence": actor_evidence,
+        "shared_setup": {
+            "actor_count": runtime["actor_count"],
+            "actor_setup_wall_seconds": runtime["actor_setup_wall_seconds"],
+            "actor_setup_peak_rss_bytes": runtime["actor_setup_peak_rss_bytes"],
+            "runtime_artifact": "runtime.json",
+        },
+        "protocol_correction": normalized_config["protocol_correction"],
+        "stages": {
+            name: {
+                "path": f"{name}/stage.json",
+                "sha256": sha256_file(destination / name / "stage.json"),
+            }
+            for name in ("data", "raw", "fqe", "mbff")
+        },
+        "data": {
+            "export_manifest_sha256": data_stage["export_manifest_sha256"],
+            "fit_membership_sha256": data_stage["fit_membership_sha256"],
+            "validation_membership_sha256": data_stage[
+                "validation_membership_sha256"
+            ],
+            "s0_membership_sha256": data_stage["s0_membership_sha256"],
+            "query_sha256": data_stage["query_sha256"],
+        },
+        "ranking_seals": {
+            raw_stage["method_id"]: {
+                "path": "raw/ranking.seal.json",
+                "sha256": raw_stage["seal_sha256"],
+            },
+            fqe_stage["method_id"]: {
+                "path": "fqe/ranking.seal.json",
+                "sha256": fqe_stage["seal_sha256"],
+            },
+            mbff_stage["method_id"]: {
+                "path": "mbff/ranking.seal.json",
+                "sha256": mbff_stage["seal_sha256"],
+            },
+        },
+        "rankings": {
+            raw_stage["method_id"]: raw_stage["ranking"],
+            fqe_stage["method_id"]: fqe_stage["ranking"],
+            mbff_stage["method_id"]: mbff_stage["ranking"],
+        },
+        "scientific_status": {
+            "FH_KMIFQE_G099_H1000": "NO_GO_EXISTING_LOG_DENSITY_AND_TARGET_POLICY_SEMANTICS",
+            "ETM_MBOPE_G099_H1000": "NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT",
+            "discounted_value_join": "WAITING_ORACLE",
+            "exact_density_panel": "INCOMPLETE_REQUIRED_DENSITY_PANEL",
+        },
+        "runtime": {
+            "path": "runtime.json",
+            "sha256": sha256_file(runtime_path),
+        },
+    }
+    _write_canonical_json(final_path, run)
+    return run
 
 
 def _toy_method_scope(method_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
@@ -585,15 +1615,15 @@ def run_toy(
         "termination_mode": "horizon_only",
     }
     config: dict[str, Any] = {
-        "schema": "policy-learnware.toy-config.v2",
+        "schema": "policy-learnware.toy-config.v3",
         "seed": seed,
         "context_id": TOY_CONTEXT,
         "gamma": TOY_GAMMA,
         "horizon": TOY_HORIZON,
         "episodes": 48,
         "candidate_count": 5,
-        "candidate_key_derivation": (
-            "sha256(seed,method_id,candidate_id,phase)[0:8]_xor_row_index"
+        "common_random_key_derivation": (
+            "sha256(seed,method_id,context_id,phase)[0:8]_xor_row_or_s0_index"
         ),
         "fqe": {
             "ridge": 1e-7,
@@ -649,22 +1679,22 @@ def run_toy(
                 actual_method_id = estimator.method_id
             elif estimator.method_id != actual_method_id:
                 raise RuntimeError("one estimator family produced inconsistent method IDs")
-            fit_keys = _candidate_keys(
+            fit_keys = _common_random_keys(
                 seed=seed,
                 method_id=estimator.method_id,
-                candidate_id=candidate.policy_id,
-                phase="fit",
+                context_id=TOY_CONTEXT,
+                phase="fit_transition_rows",
                 rows=len(batch),
             )
             if estimator_type is FiniteHorizonKMIFQE:
                 estimator.fit(batch, candidate, behavior_density=density, fit_keys=fit_keys)
             else:
                 estimator.fit(batch, candidate, fit_keys=fit_keys)
-            estimate_keys = _candidate_keys(
+            estimate_keys = _common_random_keys(
                 seed=seed,
                 method_id=estimator.method_id,
-                candidate_id=candidate.policy_id,
-                phase="estimate",
+                context_id=TOY_CONTEXT,
+                phase="estimate_s0_rows",
                 rows=len(initial),
             )
             method_estimates[candidate.policy_id] = estimator.estimate(initial, keys=estimate_keys)
@@ -687,21 +1717,21 @@ def run_toy(
         estimator.fit(
             batch,
             model_fit_actor,
-            fit_keys=_candidate_keys(
+            fit_keys=_common_random_keys(
                 seed=seed,
                 method_id=estimator.method_id,
-                candidate_id="__transition_model_fit__",
-                phase="fit",
+                context_id=TOY_CONTEXT,
+                phase="transition_model_fit",
                 rows=1,
             ),
         )
         method_estimates = {}
         for candidate in candidates:
-            estimate_keys = _candidate_keys(
+            estimate_keys = _common_random_keys(
                 seed=seed,
                 method_id=estimator.method_id,
-                candidate_id=candidate.policy_id,
-                phase="estimate",
+                context_id=TOY_CONTEXT,
+                phase="estimate_s0_rows",
                 rows=len(initial),
             )
             method_estimates[candidate.policy_id] = estimator.estimate(
@@ -1077,6 +2107,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="emit the stable fail-closed production readiness decision",
     )
     preflight.add_argument("--output", required=True, type=Path)
+    real_smoke = commands.add_parser(
+        "real-smoke",
+        help="run Raw, FQE, and MB-FF through oracle-blind ranking seals",
+    )
+    real_smoke.add_argument("--config", required=True, type=Path)
+    real_smoke.add_argument("--expected-config-sha256", required=True)
+    real_smoke.add_argument("--output", required=True, type=Path)
+    real_smoke.add_argument("--resume", action="store_true")
     return parser
 
 
@@ -1117,6 +2155,40 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 2
+    if args.command == "real-smoke":
+        try:
+            report = run_real_smoke(
+                args.config,
+                args.output,
+                expected_config_sha256=args.expected_config_sha256,
+                resume=args.resume,
+            )
+        except (GateClosed, DataValidationError) as exc:
+            print(
+                json.dumps(
+                    {"status": exc.status, "detail": exc.detail}, sort_keys=True
+                )
+            )
+            return 2
+        run_path = Path(args.output).resolve() / "run.json"
+        print(
+            json.dumps(
+                {
+                    "status": report["status"],
+                    "metrics_status": report["metrics_status"],
+                    "run": str(run_path),
+                    "run_sha256": sha256_file(run_path),
+                    "ranking_seal_sha256": {
+                        method_id: reference["sha256"]
+                        for method_id, reference in sorted(
+                            report["ranking_seals"].items()
+                        )
+                    },
+                },
+                sort_keys=True,
+            )
+        )
+        return 0 if report["status"] == "SEALED_PRE_ORACLE" else 2
     report = census_real_assets(
         dataset_path=args.dataset,
         oracle_path=args.oracle,

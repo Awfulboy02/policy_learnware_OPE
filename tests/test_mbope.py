@@ -28,7 +28,8 @@ class LinearActor:
         keys: np.ndarray,
     ) -> np.ndarray:
         checked_keys = np.asarray(keys, dtype=np.uint64)
-        assert checked_keys.shape == (len(observations),)
+        assert checked_keys.ndim in {1, 2}
+        assert len(checked_keys) == len(observations)
         self.calls.append((native_timestep.copy(), checked_keys.copy()))
         return -0.25 * observations[:, :1] + 0.02 * native_timestep[:, None]
 
@@ -44,10 +45,30 @@ class KeyedLinearActor(LinearActor):
         *,
         keys: np.ndarray,
     ) -> np.ndarray:
-        base = super().sample_actions(observations, native_timestep, keys=keys)
         key_array = np.asarray(keys, dtype=np.uint64)
-        jitter = ((key_array % 1009).astype(float) / 1008.0 - 0.5) * 0.02
+        assert key_array.shape == (len(observations), 2)
+        base = super().sample_actions(observations, native_timestep, keys=keys)
+        folded = key_array[:, 0] ^ key_array[:, 1]
+        jitter = ((folded % 1009).astype(float) / 1008.0 - 0.5) * 0.02
         return base + jitter[:, None]
+
+    def next_action_keys(self, keys: np.ndarray) -> np.ndarray:
+        return _fake_split_next(keys)
+
+
+def _fake_split_next(keys: np.ndarray) -> np.ndarray:
+    """Small deterministic stand-in for a provider-owned JAX split operation."""
+
+    raw = np.asarray(keys, dtype=np.uint64)
+    assert raw.ndim == 2 and raw.shape[1] == 2
+    mask = np.uint64((1 << 32) - 1)
+    first = (raw[:, 0] * np.uint64(1664525) + np.uint64(1013904223)) & mask
+    second = (
+        raw[:, 1] * np.uint64(22695477)
+        + np.uint64(1)
+        + (raw[:, 0] ^ np.uint64(0x9E3779B9))
+    ) & mask
+    return np.stack([first, second], axis=1).astype(np.uint32)
 
 
 class ActionsOnlyActor:
@@ -317,6 +338,10 @@ def test_keyed_stochastic_actor_is_reproducible_and_bad_timestep_fails_closed() 
     assert first.value == pytest.approx(second.value, rel=1e-9, abs=1e-10)
     assert first.support["actor_semantics"] == "stochastic_keyed"
     assert first.diagnostics["rollout_key_digest"] == second.diagnostics["rollout_key_digest"]
+    assert first.diagnostics["actor_key_advancement"] == "PROVIDER_NEXT_ACTION_KEYS_CHAIN"
+    assert first.diagnostics["actor_key_data_shape"] == [2]
+    assert first.diagnostics["actor_key_ledger_digest"] == second.diagnostics["actor_key_ledger_digest"]
+    assert first.diagnostics["actor_model_random_domains_separate"] is True
     assert (
         first.provenance["physical_membership_sha256"]
         == second.provenance["physical_membership_sha256"]
@@ -326,6 +351,120 @@ def test_keyed_stochastic_actor_is_reproducible_and_bad_timestep_fails_closed() 
         DOPEStyleMBFFEstimator(horizon=5).fit(
             object(), actor, fit_keys=np.asarray([1], dtype=np.uint64)
         )
+
+
+def test_keyed_actor_rollouts_use_split_chain_and_candidate_independent_crn() -> None:
+    class Candidate(KeyedLinearActor):
+        def __init__(self, candidate_id: str, offset: float) -> None:
+            super().__init__()
+            self.policy_id = candidate_id
+            self.offset = float(offset)
+
+        def sample_actions(self, observations, native_timestep, *, keys):
+            return super().sample_actions(
+                observations, native_timestep, keys=keys
+            ) + self.offset
+
+    batch = _linear_batch(episodes=32)
+    initial = np.asarray([[-0.4], [0.6]])
+    roots = np.asarray([71, 902], dtype=np.uint64)
+
+    def run(order: tuple[str, str]):
+        estimator = DOPEStyleMBFFEstimator(
+            horizon=5,
+            rollouts_per_initial=3,
+            ensemble_members=2,
+            hidden_dim=12,
+        ).fit(
+            batch,
+            KeyedLinearActor(),
+            fit_keys=np.asarray([404], dtype=np.uint64),
+        )
+        actors = {
+            "policy-a": Candidate("policy-a", -0.03),
+            "policy-b": Candidate("policy-b", 0.04),
+        }
+        results = {}
+        ledgers = {}
+        for candidate_id in order:
+            actor = actors[candidate_id]
+            result = estimator.estimate(initial, keys=roots, candidate=actor)
+            results[candidate_id] = result
+            ledgers[candidate_id] = [keys.copy() for _, keys in actor.calls]
+        return results, ledgers
+
+    forward_results, forward_ledgers = run(("policy-a", "policy-b"))
+    reverse_results, reverse_ledgers = run(("policy-b", "policy-a"))
+
+    for ledgers in (forward_ledgers, reverse_ledgers):
+        assert len(ledgers["policy-a"]) == 5
+        assert all(keys.shape == (6, 2) for keys in ledgers["policy-a"])
+        assert np.unique(ledgers["policy-a"][0], axis=0).shape[0] == 6
+        for current, following in zip(
+            ledgers["policy-a"], ledgers["policy-a"][1:]
+        ):
+            np.testing.assert_array_equal(following, _fake_split_next(current))
+        for left, right in zip(ledgers["policy-a"], ledgers["policy-b"]):
+            np.testing.assert_array_equal(left, right)
+
+    for candidate_id in ("policy-a", "policy-b"):
+        forward = forward_results[candidate_id]
+        reverse = reverse_results[candidate_id]
+        assert forward.value == pytest.approx(reverse.value, rel=1e-12, abs=1e-12)
+        assert (
+            forward.diagnostics["actor_key_ledger_digest"]
+            == reverse.diagnostics["actor_key_ledger_digest"]
+        )
+        assert forward.diagnostics["actor_key_root_digest"] == reverse.diagnostics["actor_key_root_digest"]
+        assert forward.diagnostics["model_random_root_digest"] == reverse.diagnostics["model_random_root_digest"]
+        assert (
+            forward.diagnostics["actor_key_root_digest"]
+            != forward.diagnostics["model_random_root_digest"]
+        )
+        assert forward.diagnostics["candidate_id_excluded_from_random_key_derivation"] is True
+        assert forward.diagnostics["actor_calls"] == 5
+        assert forward.cost["actor_queries"] == 30
+
+
+def test_keyed_actor_next_key_contract_fails_closed() -> None:
+    class MissingNext(KeyedLinearActor):
+        next_action_keys = None
+
+    class BadNext(KeyedLinearActor):
+        def __init__(self, result: object) -> None:
+            super().__init__()
+            self.result = result
+
+        def next_action_keys(self, keys: np.ndarray) -> np.ndarray:
+            if callable(self.result):
+                return self.result(keys)
+            return np.asarray(self.result)
+
+    estimator = DOPEStyleMBFFEstimator(
+        horizon=5,
+        rollouts_per_initial=2,
+        ensemble_members=2,
+        hidden_dim=12,
+    ).fit(
+        _linear_batch(episodes=24),
+        KeyedLinearActor(),
+        fit_keys=np.asarray([1], dtype=np.uint64),
+    )
+    initial = np.asarray([[0.0]])
+    roots = np.asarray([9], dtype=np.uint64)
+
+    with pytest.raises(ValueError, match="next_action_keys"):
+        estimator.estimate(initial, keys=roots, candidate=MissingNext())
+
+    invalid_next_keys = (
+        lambda keys: np.zeros(len(keys), dtype=np.uint64),
+        lambda keys: np.full(keys.shape, np.nan),
+        lambda keys: np.full(keys.shape, 1 << 32, dtype=np.uint64),
+        lambda keys: np.full(keys.shape, -1, dtype=np.int64),
+    )
+    for invalid in invalid_next_keys:
+        with pytest.raises(ValueError, match="two-word|range|negative"):
+            estimator.estimate(initial, keys=roots, candidate=BadNext(invalid))
 
 
 def test_native_environment_termination_stops_learned_rollout() -> None:

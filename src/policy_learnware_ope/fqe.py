@@ -42,6 +42,62 @@ def _key_digest(keys: np.ndarray) -> str:
     return sha256(np.asarray(keys, dtype="<u8").tobytes()).hexdigest()
 
 
+_ACTION_KEY_SCHEDULE = "sha256_domain_xor_u64_v1"
+
+
+def _derived_action_key_schedule(
+    keys: np.ndarray,
+    *,
+    sample_count: int,
+    domain: str,
+) -> np.ndarray:
+    """Derive auditable common-random-number keys for one MC query panel."""
+
+    base = np.asarray(keys, dtype=np.uint64)
+    schedule = np.empty((sample_count, *base.shape), dtype=np.uint64)
+    column_count = 1 if base.ndim == 1 else base.shape[1]
+    for sample_index in range(sample_count):
+        derived = np.array(base, copy=True)
+        for column_index in range(column_count):
+            token_bytes = sha256(
+                (
+                    f"{_ACTION_KEY_SCHEDULE}\0{domain}\0"
+                    f"{sample_index}\0{column_index}"
+                ).encode("utf-8")
+            ).digest()[:8]
+            token = np.frombuffer(token_bytes, dtype="<u8")[0]
+            if derived.ndim == 1:
+                derived ^= token
+            else:
+                # Structured JAX key words are uint32 values carried in the
+                # common uint64 validation container.  Preserve that ABI.
+                derived[:, column_index] ^= token & np.uint64(0xFFFFFFFF)
+        schedule[sample_index] = derived
+    schedule.setflags(write=False)
+    return schedule
+
+
+def _action_schedule_digest(domain: str, schedule: np.ndarray) -> str:
+    digest = sha256()
+    digest.update(b"fqe_action_key_schedule_digest_v1\0")
+    digest.update(domain.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(np.asarray(schedule.shape, dtype="<u8").tobytes())
+    digest.update(np.asarray(schedule, dtype="<u8").tobytes())
+    return digest.hexdigest()
+
+
+def _aggregate_action_schedule_digests(**parts: str) -> str:
+    digest = sha256()
+    digest.update(b"fqe_action_key_schedule_aggregate_v1\0")
+    for name, value in sorted(parts.items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"=")
+        digest.update(value.encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 class _QuadraticTimeFeatures:
     """Small ridge feature map with explicit state/action-time interactions."""
 
@@ -103,6 +159,7 @@ class FiniteHorizonFQE:
         ridge: float = 1e-6,
         max_iterations: int | None = None,
         tolerance: float = 1e-9,
+        stochastic_action_samples: int = 8,
     ) -> None:
         if (
             isinstance(gamma, (bool, np.bool_))
@@ -117,6 +174,12 @@ class FiniteHorizonFQE:
             raise ValueError("ridge must be finite and positive")
         if float(tolerance) <= 0.0 or not np.isfinite(tolerance):
             raise ValueError("tolerance must be finite and positive")
+        if (
+            isinstance(stochastic_action_samples, (bool, np.bool_))
+            or int(stochastic_action_samples) != stochastic_action_samples
+            or int(stochastic_action_samples) < 2
+        ):
+            raise ValueError("stochastic_action_samples must be an integer >= 2")
         if max_iterations is None:
             if 0.0 < float(gamma) < 1.0:
                 contraction_iterations = int(
@@ -135,6 +198,7 @@ class FiniteHorizonFQE:
         self.ridge = float(ridge)
         self.max_iterations = int(max_iterations)
         self.tolerance = float(tolerance)
+        self.stochastic_action_samples = int(stochastic_action_samples)
         self._reset_fit_state()
 
     def _reset_fit_state(self) -> None:
@@ -142,6 +206,7 @@ class FiniteHorizonFQE:
         self._coefficient: np.ndarray | None = None
         self._candidate: CandidateActionProvider | None = None
         self._candidate_id: str | None = None
+        self._candidate_semantics: PolicySemantics | None = None
         self._gate: tuple[EstimateStatus, str] | None = None
         self._support: dict[str, Any] = {}
         self._provenance: dict[str, Any] = {}
@@ -170,18 +235,34 @@ class FiniteHorizonFQE:
             self._candidate_id = policy_id(candidate)
             keys = validate_action_keys(fit_keys, len(batch))
             semantics = policy_semantics(candidate)
+            self._candidate_semantics = semantics
             self._base_provenance(batch, semantics)
             self._provenance["fit_key_digest"] = _key_digest(keys)
-            if semantics is not PolicySemantics.DETERMINISTIC:
-                self._close_gate(
-                    EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS,
-                    "FQE currently implements deterministic evaluation-policy Bellman targets only",
-                )
-                return self
             mask = batch.bootstrap_mask(self.horizon)
-            next_action = self._query_next_actions(batch, candidate, keys, mask)
-            self._measure_action_support(batch, candidate, keys)
-            self._fit_ridge(batch, next_action, mask, np.ones(len(batch), dtype=np.float64))
+            next_actions, next_schedule_digest = self._query_next_actions(
+                batch, candidate, keys, mask, semantics
+            )
+            support_schedule_digest = self._measure_action_support(
+                batch, candidate, keys, semantics
+            )
+            fit_schedule_digest = _aggregate_action_schedule_digests(
+                next=next_schedule_digest,
+                support=support_schedule_digest,
+            )
+            self._provenance.update(
+                {
+                    "fit_next_action_key_schedule_digest": next_schedule_digest,
+                    "fit_support_action_key_schedule_digest": support_schedule_digest,
+                    "fit_action_key_schedule_digest": fit_schedule_digest,
+                }
+            )
+            self._diagnostics["fit_action_key_schedule_digest"] = fit_schedule_digest
+            self._fit_ridge(
+                batch,
+                next_actions,
+                mask,
+                np.ones(len(batch), dtype=np.float64),
+            )
         except DataValidationError as exc:
             try:
                 status = EstimateStatus(exc.status)
@@ -218,6 +299,21 @@ class FiniteHorizonFQE:
             "source_digest": batch.source_digest,
             "candidate_id": self._candidate_id,
             "candidate_semantics": semantics.value,
+            "policy_expectation": (
+                "EXACT_DETERMINISTIC"
+                if semantics is PolicySemantics.DETERMINISTIC
+                else "STOCHASTIC_KEYED_MONTE_CARLO_EXPECTATION"
+            ),
+            "action_expectation_samples": (
+                1
+                if semantics is PolicySemantics.DETERMINISTIC
+                else self.stochastic_action_samples
+            ),
+            "action_key_schedule": (
+                "caller_keys_exact"
+                if semantics is PolicySemantics.DETERMINISTIC
+                else _ACTION_KEY_SCHEDULE
+            ),
         }
 
     def _close_gate(self, status: EstimateStatus, detail: str) -> None:
@@ -231,29 +327,62 @@ class FiniteHorizonFQE:
         candidate: CandidateActionProvider,
         keys: np.ndarray,
         mask: np.ndarray,
-    ) -> np.ndarray:
+        semantics: PolicySemantics,
+    ) -> tuple[tuple[np.ndarray, ...], str]:
         active = mask.astype(bool)
-        result = np.zeros_like(batch.action, dtype=np.float64)
-        if np.any(active):
-            queried = candidate_actions(
-                candidate,
-                batch.next_observation[active],
-                batch.native_timestep[active] + 1,
-                keys=keys[active],
-                require_deterministic=True,
+        active_keys = keys[active]
+        if semantics is PolicySemantics.DETERMINISTIC:
+            schedule = np.expand_dims(active_keys, axis=0)
+        else:
+            schedule = _derived_action_key_schedule(
+                active_keys,
+                sample_count=self.stochastic_action_samples,
+                domain="fit_next_action",
             )
-            if queried.shape[1] != batch.action.shape[1]:
-                raise DataValidationError(
-                    EstimateStatus.INVALID_DATA.value,
-                    "candidate action width differs from logged action ABI",
+        results: list[np.ndarray] = []
+        for sample_keys in schedule:
+            result = np.zeros_like(batch.action, dtype=np.float64)
+            if np.any(active):
+                queried = candidate_actions(
+                    candidate,
+                    batch.next_observation[active],
+                    batch.native_timestep[active] + 1,
+                    keys=sample_keys,
+                    require_deterministic=(
+                        semantics is PolicySemantics.DETERMINISTIC
+                    ),
                 )
-            result[active] = queried
-        return result
+                if queried.shape[1] != batch.action.shape[1]:
+                    raise DataValidationError(
+                        EstimateStatus.INVALID_DATA.value,
+                        "candidate action width differs from logged action ABI",
+                    )
+                result[active] = queried
+            results.append(result)
+        sample_count = len(results)
+        self._diagnostics.update(
+            {
+                "bellman_action_samples": sample_count,
+                "bellman_action_query_count": (
+                    sample_count if np.any(active) else 0
+                ),
+                "bellman_action_query_rows": int(sample_count * np.sum(active)),
+            }
+        )
+        self._cost.update(
+            {
+                "bellman_actor_query_calls": (
+                    sample_count if np.any(active) else 0
+                ),
+                "bellman_actor_query_rows": int(sample_count * np.sum(active)),
+            }
+        )
+        return tuple(results), _action_schedule_digest("fit_next_action", schedule)
 
     def _fit_ridge(
         self,
         batch: TransitionBatch,
-        next_action: np.ndarray,
+        next_actions: tuple[np.ndarray, ...],
         mask: np.ndarray,
         sample_weight: np.ndarray,
     ) -> None:
@@ -267,11 +396,21 @@ class FiniteHorizonFQE:
             batch.action,
             batch.native_timestep / self.horizon,
         )
-        next_x = self._features.transform(
-            batch.next_observation,
-            next_action,
-            (batch.native_timestep + 1) / self.horizon,
-        )
+        if len(next_actions) == 1:
+            next_x = self._features.transform(
+                batch.next_observation,
+                next_actions[0],
+                (batch.native_timestep + 1) / self.horizon,
+            )
+        else:
+            next_x = np.zeros_like(current_x)
+            for next_action in next_actions:
+                next_x += self._features.transform(
+                    batch.next_observation,
+                    next_action,
+                    (batch.native_timestep + 1) / self.horizon,
+                )
+            next_x /= len(next_actions)
         normalizer = float(np.sum(weight))
         gram = (current_x.T @ (weight[:, None] * current_x)) / normalizer
         gram += self.ridge * np.eye(gram.shape[0], dtype=np.float64)
@@ -330,38 +469,74 @@ class FiniteHorizonFQE:
         batch: TransitionBatch,
         candidate: CandidateActionProvider,
         keys: np.ndarray,
-    ) -> None:
-        current_action = candidate_actions(
-            candidate,
-            batch.observation,
-            batch.native_timestep,
-            keys=keys ^ np.uint64(0xA5A5A5A5A5A5A5A5),
-            require_deterministic=True,
-        )
-        if current_action.shape != batch.action.shape:
-            raise DataValidationError(
-                EstimateStatus.INVALID_DATA.value,
-                "candidate action width differs from logged action ABI",
+        semantics: PolicySemantics,
+    ) -> str:
+        if semantics is PolicySemantics.DETERMINISTIC:
+            support_keys = keys ^ np.uint64(0xA5A5A5A5A5A5A5A5)
+            schedule = np.expand_dims(support_keys, axis=0)
+        else:
+            schedule = _derived_action_key_schedule(
+                keys,
+                sample_count=self.stochastic_action_samples,
+                domain="fit_support_action",
             )
         action_scale = np.std(batch.action, axis=0)
         action_scale[action_scale < 1e-6] = 1.0
-        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            standardized_delta = (current_action - batch.action) / action_scale
-            distance = np.linalg.norm(standardized_delta, axis=1)
-        if not np.all(np.isfinite(standardized_delta)) or not np.all(
-            np.isfinite(distance)
-        ):
-            raise DataValidationError(
-                EstimateStatus.FAILED.value,
-                "action-support distance became non-finite",
+        distances: list[np.ndarray] = []
+        for sample_keys in schedule:
+            current_action = candidate_actions(
+                candidate,
+                batch.observation,
+                batch.native_timestep,
+                keys=sample_keys,
+                require_deterministic=(semantics is PolicySemantics.DETERMINISTIC),
             )
+            if current_action.shape != batch.action.shape:
+                raise DataValidationError(
+                    EstimateStatus.INVALID_DATA.value,
+                    "candidate action width differs from logged action ABI",
+                )
+            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                standardized_delta = (current_action - batch.action) / action_scale
+                distance = np.linalg.norm(standardized_delta, axis=1)
+            if not np.all(np.isfinite(standardized_delta)) or not np.all(
+                np.isfinite(distance)
+            ):
+                raise DataValidationError(
+                    EstimateStatus.FAILED.value,
+                    "action-support distance became non-finite",
+                )
+            distances.append(distance)
+        distance = np.concatenate(distances)
+        schedule_digest = _action_schedule_digest("fit_support_action", schedule)
         self._support = {
-            "kind": "pointwise_logged_state_action_distance",
+            "kind": (
+                "pointwise_logged_state_action_distance"
+                if semantics is PolicySemantics.DETERMINISTIC
+                else "monte_carlo_logged_state_action_distance"
+            ),
             "mean_action_distance": float(np.mean(distance)),
             "p95_action_distance": float(np.quantile(distance, 0.95)),
             "max_action_distance": float(np.max(distance)),
-            "support_rows": int(len(distance)),
+            "support_rows": int(len(batch)),
+            "support_action_draws": int(len(distance)),
+            "action_expectation_samples": int(len(schedule)),
+            "support_action_key_schedule_digest": schedule_digest,
         }
+        self._diagnostics.update(
+            {
+                "support_action_samples": int(len(schedule)),
+                "support_action_query_count": int(len(schedule)),
+                "support_action_query_rows": int(len(distance)),
+            }
+        )
+        self._cost.update(
+            {
+                "support_actor_query_calls": int(len(schedule)),
+                "support_actor_query_rows": int(len(distance)),
+            }
+        )
+        return schedule_digest
 
     def estimate(
         self,
@@ -409,24 +584,74 @@ class FiniteHorizonFQE:
             )
         if self._candidate is None or self._features is None or self._coefficient is None:
             raise RuntimeError("fitted estimator state is incomplete")
-        actions = candidate_actions(
-            self._candidate,
-            observations,
-            times,
-            keys=checked_keys,
-            require_deterministic=True,
+        if self._candidate_semantics is PolicySemantics.DETERMINISTIC:
+            schedule = np.expand_dims(checked_keys, axis=0)
+        elif self._candidate_semantics is PolicySemantics.STOCHASTIC_KEYED:
+            schedule = _derived_action_key_schedule(
+                checked_keys,
+                sample_count=self.stochastic_action_samples,
+                domain="estimate_initial_action",
+            )
+        else:
+            raise RuntimeError("fitted estimator lacks candidate policy semantics")
+        sampled_values: list[np.ndarray] = []
+        for sample_keys in schedule:
+            actions = candidate_actions(
+                self._candidate,
+                observations,
+                times,
+                keys=sample_keys,
+                require_deterministic=(
+                    self._candidate_semantics is PolicySemantics.DETERMINISTIC
+                ),
+            )
+            features = self._features.transform(
+                observations, actions, times / self.horizon
+            )
+            sampled_values.append(features @ self._coefficient)
+        value_panel = np.stack(sampled_values, axis=0)
+        values = np.mean(value_panel, axis=0)
+        estimate_schedule_digest = _action_schedule_digest(
+            "estimate_initial_action", schedule
         )
-        features = self._features.transform(observations, actions, times / self.horizon)
-        values = features @ self._coefficient
+        estimate_provenance.update(
+            {
+                "estimate_action_key_schedule_digest": estimate_schedule_digest,
+                "estimate_action_samples": int(len(schedule)),
+            }
+        )
         estimate_seconds = float(perf_counter() - start)
         cost = dict(self._cost)
         cost["estimate_seconds"] = estimate_seconds
         cost["runtime_seconds"] = float(cost.get("fit_seconds", 0.0) + estimate_seconds)
+        cost.update(
+            {
+                "estimate_actor_query_calls": int(len(schedule)),
+                "estimate_actor_query_rows": int(len(schedule) * len(observations)),
+                "actor_query_calls": int(
+                    cost.get("bellman_actor_query_calls", 0)
+                    + cost.get("support_actor_query_calls", 0)
+                    + len(schedule)
+                ),
+                "actor_query_rows": int(
+                    cost.get("bellman_actor_query_rows", 0)
+                    + cost.get("support_actor_query_rows", 0)
+                    + len(schedule) * len(observations)
+                ),
+            }
+        )
         diagnostics = dict(self._diagnostics)
         diagnostics.update(
             {
                 "initial_state_count": int(len(observations)),
                 "initial_value_std": float(np.std(values)),
+                "initial_action_samples": int(len(schedule)),
+                "initial_action_query_count": int(len(schedule)),
+                "initial_action_query_rows": int(len(schedule) * len(observations)),
+                "initial_action_value_within_state_std_mean": float(
+                    np.mean(np.std(value_panel, axis=0))
+                ),
+                "estimate_action_key_schedule_digest": estimate_schedule_digest,
             }
         )
         return ValueEstimate(
@@ -539,6 +764,7 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
                 semantics = policy_semantics(candidate)
             except DataValidationError:
                 semantics = PolicySemantics.STOCHASTIC_KEYED
+            self._candidate_semantics = semantics
             self._base_provenance(batch, semantics)
             self._provenance["fit_key_digest"] = _key_digest(keys)
             self._provenance.pop("planned_neural_critic_port", None)
@@ -585,6 +811,12 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
                 )
                 return self
             if semantics is not PolicySemantics.DETERMINISTIC:
+                self._provenance.update(
+                    {
+                        "policy_expectation": "NO_GO_UNSUPPORTED_STOCHASTIC_KEYED",
+                        "action_expectation_samples": 0,
+                    }
+                )
                 self._close_gate(
                     EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS,
                     "this KMIFQE adaptation requires a deterministic evaluation policy",
@@ -597,8 +829,11 @@ class FiniteHorizonKMIFQE(FiniteHorizonFQE):
                 )
                 return self
             mask = batch.bootstrap_mask(self.horizon)
-            next_target_action = self._query_next_actions(batch, candidate, keys, mask)
-            self._measure_action_support(batch, candidate, keys)
+            next_target_actions, _ = self._query_next_actions(
+                batch, candidate, keys, mask, semantics
+            )
+            next_target_action = next_target_actions[0]
+            self._measure_action_support(batch, candidate, keys, semantics)
             active = mask.astype(bool)
             if not np.any(active):
                 self._close_gate(

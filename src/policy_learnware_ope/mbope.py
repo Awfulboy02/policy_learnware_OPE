@@ -29,6 +29,7 @@ import numpy as np
 from .core import (
     DataValidationError,
     EstimateStatus,
+    PolicySemantics,
     TransitionBatch,
     ValueEstimate,
     candidate_actions,
@@ -178,6 +179,70 @@ def _seed_from_keys(keys: np.ndarray, salt: int) -> int:
 
 def _key_digest(keys: np.ndarray) -> str:
     return sha256(np.asarray(keys, dtype="<u8").tobytes()).hexdigest()
+
+
+_ACTOR_KEY_DOMAIN = 0x4143544F525F4B59
+_MODEL_RANDOM_DOMAIN = 0x4D4F44454C5F524E
+_UINT32_MAX = (1 << 32) - 1
+
+
+def _domain_key_digest(domain: str, keys: np.ndarray) -> str:
+    digest = sha256()
+    array = np.asarray(keys, dtype="<u8")
+    digest.update(b"mbope_key_domain_v1\0")
+    digest.update(domain.encode("ascii") + b"\0")
+    digest.update(np.asarray(array.shape, dtype="<u8").tobytes())
+    digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _initial_actor_keys(rollout_roots: np.ndarray) -> np.ndarray:
+    """Map each scalar rollout root to lossless two-word actor key data."""
+
+    structured = np.empty((len(rollout_roots), 2), dtype=np.uint64)
+    for row, root in enumerate(np.asarray(rollout_roots, dtype=np.uint64)):
+        derived = _mix64(int(root) ^ _ACTOR_KEY_DOMAIN)
+        structured[row, 0] = derived >> 32
+        structured[row, 1] = derived & _UINT32_MAX
+    return structured
+
+
+def _structured_actor_keys(value: Any, name: str, *, rows: int) -> np.ndarray:
+    raw = np.asarray(value)
+    if raw.ndim != 2 or raw.shape != (rows, 2) or raw.dtype.kind not in "iu":
+        raise DataValidationError(
+            EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS.value,
+            f"{name} must return one two-word integer key per actor row",
+        )
+    if raw.dtype.kind == "i" and np.any(raw < 0):
+        raise DataValidationError(
+            EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS.value,
+            f"{name} returned negative key data",
+        )
+    if np.any(raw > _UINT32_MAX):
+        raise DataValidationError(
+            EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS.value,
+            f"{name} returned key data outside the uint32 range",
+        )
+    return np.asarray(raw, dtype=np.uint64)
+
+
+def _next_actor_keys(actor: Any, keys: np.ndarray) -> np.ndarray:
+    advance = getattr(actor, "next_action_keys", None)
+    if not callable(advance):
+        raise DataValidationError(
+            EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS.value,
+            "STOCHASTIC_KEYED actor must expose next_action_keys(keys) for its "
+            "provider-native split chain",
+        )
+    try:
+        next_keys = advance(np.array(keys, copy=True))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise DataValidationError(
+            EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS.value,
+            "STOCHASTIC_KEYED actor could not advance its explicit key data",
+        ) from exc
+    return _structured_actor_keys(next_keys, "next_action_keys", rows=len(keys))
 
 
 @dataclass
@@ -1180,7 +1245,16 @@ class _BaseMBOPE:
         if actor is None:
             raise ValueError("a candidate actor is required")
         actor_id = policy_id(actor)
-        actor_semantics = policy_semantics(actor).value
+        semantics = policy_semantics(actor)
+        actor_semantics = semantics.value
+        if semantics is PolicySemantics.STOCHASTIC_KEYED and not callable(
+            getattr(actor, "next_action_keys", None)
+        ):
+            raise DataValidationError(
+                EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS.value,
+                "STOCHASTIC_KEYED actor must expose next_action_keys(keys) for "
+                "per-step provider-native key advancement",
+            )
         initial = _matrix(initial_observations, "initial_observations")
         if initial.shape[1] != self._observation_dim or not np.isfinite(initial).all():
             raise ValueError("initial observation ABI differs from fitted data")
@@ -1210,7 +1284,29 @@ class _BaseMBOPE:
             ],
             dtype=np.uint64,
         )
-        rng = np.random.default_rng(_seed_from_keys(rollout_roots, 0x4D4F44454C))
+        model_roots = np.asarray(
+            [
+                _mix64(int(root) ^ _MODEL_RANDOM_DOMAIN)
+                for root in rollout_roots
+            ],
+            dtype=np.uint64,
+        )
+        rng = np.random.default_rng(_seed_from_keys(model_roots, _MODEL_RANDOM_DOMAIN))
+        actor_chain_keys = (
+            _initial_actor_keys(rollout_roots)
+            if semantics is PolicySemantics.STOCHASTIC_KEYED
+            else None
+        )
+        actor_root_digest = _domain_key_digest(
+            "ACTOR_CHAIN_V1",
+            actor_chain_keys if actor_chain_keys is not None else rollout_roots,
+        )
+        model_random_root_digest = _domain_key_digest(
+            "MODEL_ROLLOUT_V1",
+            model_roots,
+        )
+        actor_key_ledger = sha256()
+        actor_key_ledger.update(b"mbope_actor_key_ledger_v1\0")
         member_index = np.asarray(
             [_mix64(int(key) ^ 0x454E53454D424C45) % self.member_count for key in rollout_roots],
             dtype=np.int64,
@@ -1228,14 +1324,28 @@ class _BaseMBOPE:
         maximum_absolute_state = float(np.max(np.abs(state)))
         while np.any(alive):
             rows = np.flatnonzero(alive)
-            action_keys = np.asarray(
-                [
-                    _mix64(int(rollout_roots[row]) ^ _mix64(int(timestep[row]) + 0x414354))
-                    for row in rows
-                ],
-                dtype=np.uint64,
+            if actor_chain_keys is not None:
+                action_keys = np.array(actor_chain_keys[rows], copy=True)
+            else:
+                action_keys = np.asarray(
+                    [
+                        _mix64(
+                            int(rollout_roots[row])
+                            ^ _mix64(int(timestep[row]) + 0x414354)
+                        )
+                        for row in rows
+                    ],
+                    dtype=np.uint64,
+                )
+            actor_key_ledger.update(np.asarray(rows, dtype="<u8").tobytes())
+            actor_key_ledger.update(np.asarray(timestep[rows], dtype="<u8").tobytes())
+            actor_key_ledger.update(
+                np.asarray(action_keys.shape, dtype="<u8").tobytes()
             )
+            actor_key_ledger.update(np.asarray(action_keys, dtype="<u8").tobytes())
             actions = _sample_actor(actor, state[rows], timestep[rows], action_keys)
+            if actor_chain_keys is not None:
+                actor_chain_keys[rows] = _next_actor_keys(actor, action_keys)
             if actions.shape[1] != self._action_dim:
                 raise ValueError("actor action ABI differs from fitted data")
             if self._behavior_action_mean is None or self._behavior_action_scale is None:
@@ -1300,6 +1410,21 @@ class _BaseMBOPE:
             "actor_rows": actor_rows,
             "actor_queries_only_inside_learned_model": True,
             "action_keys_explicit_for_every_row": True,
+            "actor_key_advancement": (
+                "PROVIDER_NEXT_ACTION_KEYS_CHAIN"
+                if semantics is PolicySemantics.STOCHASTIC_KEYED
+                else "STATELESS_DETERMINISTIC_QUERY_KEYS"
+            ),
+            "actor_key_data_shape": (
+                [2] if semantics is PolicySemantics.STOCHASTIC_KEYED else []
+            ),
+            "actor_key_root_digest": actor_root_digest,
+            "actor_key_ledger_digest": actor_key_ledger.hexdigest(),
+            "model_random_root_digest": model_random_root_digest,
+            "actor_model_random_domains_separate": (
+                actor_root_digest != model_random_root_digest
+            ),
+            "candidate_id_excluded_from_random_key_derivation": True,
             "rollout_key_digest": _key_digest(root_keys),
             "runtime_seconds": float(self._fit_seconds + estimate_seconds),
         }

@@ -16,6 +16,7 @@ from policy_learnware_ope.core import (
     validate_action_keys,
 )
 from policy_learnware_ope.fqe import FiniteHorizonFQE, FiniteHorizonKMIFQE
+from policy_learnware_ope.fqe import _derived_action_key_schedule
 
 
 @dataclass
@@ -34,6 +35,30 @@ class ConstantActor:
     ) -> np.ndarray:
         self.calls.append((observations.copy(), native_timestep.copy(), keys.copy()))
         return np.full((len(observations), 1), self.value, dtype=np.float64)
+
+
+@dataclass
+class KeyedActor:
+    bias: float = 0.0
+    scale: float = 1.0
+    semantics: PolicySemantics = PolicySemantics.STOCHASTIC_KEYED
+    policy_id: str = "keyed-policy"
+    calls: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = field(default_factory=list)
+
+    def actions_for_keys(self, keys: np.ndarray) -> np.ndarray:
+        scalar_key = keys if keys.ndim == 1 else np.bitwise_xor.reduce(keys, axis=1)
+        unit = (scalar_key % np.uint64(104729)).astype(np.float64) / 104728.0
+        return (self.bias + self.scale * (2.0 * unit - 1.0)).reshape(-1, 1)
+
+    def sample_actions(
+        self,
+        observations: np.ndarray,
+        native_timestep: np.ndarray,
+        *,
+        keys: np.ndarray,
+    ) -> np.ndarray:
+        self.calls.append((observations.copy(), native_timestep.copy(), keys.copy()))
+        return self.actions_for_keys(keys)
 
 
 @dataclass
@@ -95,6 +120,32 @@ def known_mdp_batch(
         timestep_provenance="episode_offsets",
         next_behavior_action=action.copy() if include_next_behavior_action else None,
         source_digest="synthetic-known-mdp",
+    )
+
+
+def action_reward_batch(*, episodes: int = 32) -> TransitionBatch:
+    """Two-step data with an identifiable Q dependence on the action."""
+
+    horizon = 2
+    n_rows = episodes * horizon
+    native_timestep = np.tile(np.arange(horizon, dtype=np.int64), episodes)
+    episode_id = np.repeat(np.arange(episodes, dtype=np.int64), horizon)
+    action = np.where(
+        (episode_id + native_timestep) % 2 == 0, -1.0, 1.0
+    ).reshape(-1, 1)
+    return TransitionBatch(
+        observation=np.zeros((n_rows, 1), dtype=np.float64),
+        action=action,
+        reward=action[:, 0].copy(),
+        next_observation=np.zeros((n_rows, 1), dtype=np.float64),
+        terminated=np.zeros(n_rows, dtype=bool),
+        truncated=np.zeros(n_rows, dtype=bool),
+        dataset_cut=np.zeros(n_rows, dtype=bool),
+        native_timestep=native_timestep,
+        episode_id=episode_id,
+        episode_offsets=np.arange(0, n_rows + 1, horizon, dtype=np.int64),
+        timestep_provenance="episode_offsets",
+        source_digest="synthetic-action-reward-mdp",
     )
 
 
@@ -279,19 +330,166 @@ def test_fqe_rejects_duck_typed_batch_that_bypasses_transition_validation() -> N
         assert result.value is None
 
 
-def test_fqe_fails_closed_for_stochastic_candidate_and_requires_keys() -> None:
-    batch = known_mdp_batch(episodes=2)
-    stochastic = ConstantActor(semantics=PolicySemantics.STOCHASTIC_KEYED)
-    estimator = FiniteHorizonFQE(horizon=3).fit(
-        batch,
-        stochastic,
-        fit_keys=np.arange(len(batch), dtype=np.uint64),
+def test_structured_mc_key_schedule_preserves_uint32_word_abi() -> None:
+    keys = np.asarray(
+        [[0, np.iinfo(np.uint32).max], [17, 2**31 + 3]], dtype=np.uint64
     )
-    result = estimator.estimate(np.zeros((1, 1)), keys=np.array([7], dtype=np.uint64))
-    assert result.status is EstimateStatus.NO_GO_TARGET_POLICY_SEMANTICS
-    assert result.value is None
-    assert stochastic.calls == []
 
+    schedule = _derived_action_key_schedule(
+        keys, sample_count=8, domain="structured-jax-key-test"
+    )
+
+    assert schedule.shape == (8, 2, 2)
+    assert schedule.dtype == np.uint64
+    assert int(np.max(schedule)) <= int(np.iinfo(np.uint32).max)
+    assert len({panel.tobytes() for panel in schedule}) == 8
+
+
+def test_fqe_stochastic_keyed_mc_is_explicit_reproducible_and_rankable() -> None:
+    batch = action_reward_batch()
+    fit_keys = np.arange(len(batch), dtype=np.uint64) + np.uint64(100)
+    estimate_keys = np.asarray([700], dtype=np.uint64)
+
+    def run(actor: KeyedActor):
+        estimator = FiniteHorizonFQE(
+            gamma=0.9,
+            horizon=2,
+            ridge=1e-8,
+            max_iterations=50,
+            tolerance=1e-8,
+            stochastic_action_samples=4,
+        ).fit(batch, actor, fit_keys=fit_keys)
+        return estimator, estimator.estimate(
+            np.zeros((1, 1)), keys=estimate_keys
+        )
+
+    first_actor = KeyedActor()
+    first_estimator, first = run(first_actor)
+    replay_estimator, replay = run(KeyedActor())
+
+    assert first.status is replay.status is EstimateStatus.PASS
+    assert first.value == pytest.approx(replay.value, rel=0.0, abs=0.0)
+    assert (
+        first.provenance["policy_expectation"]
+        == "STOCHASTIC_KEYED_MONTE_CARLO_EXPECTATION"
+    )
+    assert first.provenance["action_expectation_samples"] == 4
+    assert first.provenance["action_key_schedule"] == "sha256_domain_xor_u64_v1"
+    assert len(first.provenance["fit_action_key_schedule_digest"]) == 64
+    assert (
+        first.provenance["fit_action_key_schedule_digest"]
+        == replay.provenance["fit_action_key_schedule_digest"]
+    )
+    assert len(first.provenance["estimate_action_key_schedule_digest"]) == 64
+    assert (
+        first.provenance["estimate_action_key_schedule_digest"]
+        == replay.provenance["estimate_action_key_schedule_digest"]
+    )
+    assert first.diagnostics["bellman_action_samples"] == 4
+    assert first.diagnostics["support_action_samples"] == 4
+    assert first.diagnostics["initial_action_samples"] == 4
+    assert first.diagnostics["bellman_action_query_count"] == 4
+    assert first.diagnostics["initial_action_query_count"] == 4
+    assert first.diagnostics["initial_action_value_within_state_std_mean"] > 0.0
+    assert first.support["action_expectation_samples"] == 4
+    assert first.support["support_action_draws"] == 4 * len(batch)
+    # Four Bellman, four support, and four initial-state queries prove that K
+    # is executed rather than exported as inert metadata.
+    assert len(first_actor.calls) == 12
+    assert all(call[2].dtype == np.uint64 for call in first_actor.calls)
+    assert len({call[2].tobytes() for call in first_actor.calls[:4]}) == 4
+
+    assert first_estimator._features is not None
+    assert first_estimator._coefficient is not None
+    active = batch.bootstrap_mask(2).astype(bool)
+    next_value_draws = []
+    for _, _, sample_keys in first_actor.calls[:4]:
+        next_action = np.zeros_like(batch.action)
+        next_action[active] = first_actor.actions_for_keys(sample_keys)
+        next_features = first_estimator._features.transform(
+            batch.next_observation,
+            next_action,
+            (batch.native_timestep + 1) / 2,
+        )
+        next_value_draws.append(next_features @ first_estimator._coefficient)
+    expected_next_value = np.mean(np.stack(next_value_draws), axis=0)
+    current_features = first_estimator._features.transform(
+        batch.observation,
+        batch.action,
+        batch.native_timestep / 2,
+    )
+    residual = (
+        batch.reward
+        + 0.9 * batch.bootstrap_mask(2) * expected_next_value
+        - current_features @ first_estimator._coefficient
+    )
+    assert first.diagnostics["bellman_residual_rmse"] == pytest.approx(
+        float(np.sqrt(np.mean(np.square(residual)))), rel=1e-12, abs=1e-14
+    )
+
+    initial_value_draws = []
+    for observations, times, sample_keys in first_actor.calls[8:12]:
+        actions = first_actor.actions_for_keys(sample_keys)
+        features = first_estimator._features.transform(
+            observations, actions, times / 2
+        )
+        initial_value_draws.append(features @ first_estimator._coefficient)
+    assert first.value == pytest.approx(
+        float(np.mean(np.stack(initial_value_draws))), rel=1e-12, abs=1e-14
+    )
+
+    changed = first_estimator.estimate(
+        np.zeros((1, 1)), keys=np.asarray([701], dtype=np.uint64)
+    )
+    assert changed.status is EstimateStatus.PASS
+    assert changed.value != first.value
+    assert (
+        changed.provenance["estimate_action_key_schedule_digest"]
+        != first.provenance["estimate_action_key_schedule_digest"]
+    )
+
+    # Common caller keys preserve the policy ranking independently of the
+    # order in which the candidate-specific estimators are evaluated.
+    candidates = [
+        KeyedActor(bias=-0.4, policy_id="lower"),
+        KeyedActor(bias=0.4, policy_id="higher"),
+    ]
+    scores: dict[str, float] = {}
+    candidate_results = {}
+    candidate_key_ledgers = {}
+    for actor in reversed(candidates):
+        _, result = run(actor)
+        assert result.status is EstimateStatus.PASS
+        assert result.value is not None
+        scores[actor.policy_id] = result.value
+        candidate_results[actor.policy_id] = result
+        candidate_key_ledgers[actor.policy_id] = [
+            (times.tobytes(), keys.tobytes())
+            for _, times, keys in actor.calls
+        ]
+    assert scores["higher"] > scores["lower"]
+    assert candidate_key_ledgers["higher"] == candidate_key_ledgers["lower"]
+    for digest_field in (
+        "fit_key_digest",
+        "fit_next_action_key_schedule_digest",
+        "fit_support_action_key_schedule_digest",
+        "fit_action_key_schedule_digest",
+        "estimate_key_digest",
+        "estimate_action_key_schedule_digest",
+    ):
+        assert (
+            candidate_results["higher"].provenance[digest_field]
+            == candidate_results["lower"].provenance[digest_field]
+        )
+    assert replay_estimator._candidate_semantics is PolicySemantics.STOCHASTIC_KEYED
+
+
+def test_fqe_stochastic_sample_count_and_action_keys_fail_closed() -> None:
+    for invalid_count in (True, 1, 1.5):
+        with pytest.raises(ValueError, match=">= 2"):
+            FiniteHorizonFQE(horizon=3, stochastic_action_samples=invalid_count)
+
+    batch = known_mdp_batch(episodes=2)
     invalid_keys = FiniteHorizonFQE(horizon=3).fit(
         batch,
         ConstantActor(),
