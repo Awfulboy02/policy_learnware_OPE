@@ -43,6 +43,9 @@ EXPORT_SCHEMA = "policy-learnware.ope.existing-log-export.v1"
 MEMBERSHIP_PROTOCOL = "ope-existing-log-membership-v1"
 ACTOR_AUTHORITY_SCHEMA = "policy-learnware.ope.actor-authority.v1"
 FROZEN_FPO_PROVIDER_SCHEMA = "policy-learnware.ope.frozen-fpo-actor.v1"
+DEPLOYMENT_PRIVATE_REGISTRY_SCHEMA = (
+    "policy-learnware.v03-deployment-private-registry.v0"
+)
 FROZEN_FPO_COMMIT = "418c2554f7cd22d52e14c07d951280929d73bf2f"
 FROZEN_FPO_TREE = "54bc61908de03282897eb05ef0cc027202d2d1a7"
 _SAME_BACKEND_ATOL = 1.0e-6
@@ -826,7 +829,12 @@ def _reject_authority_leakage(value: Any, where: str = "authority") -> None:
 
 
 def _candidate_record(
-    census: Mapping[str, Any], context_id: str, candidate_id: str
+    census: Mapping[str, Any],
+    context_id: str,
+    candidate_id: str,
+    *,
+    registry_path: str | Path,
+    expected_registry_sha256: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         bank_rows = census["asset_facts"]["banks"]["full_rows"]
@@ -844,28 +852,60 @@ def _candidate_record(
     task_id = context.get("task_id")
     try:
         candidate_set = candidate_sets[task_id]
-        records = candidate_set["records"]
     except (KeyError, TypeError) as exc:
         raise _invalid(f"P0 census lacks the context task candidate set: {exc}") from exc
-    if not isinstance(records, list) or not records:
-        raise _invalid("P0 candidate record set is empty or malformed")
-    if candidate_set.get("membership_digest") != _digest(records):
+    candidate_ids = candidate_set.get("candidate_ids")
+    if (
+        not isinstance(candidate_ids, list)
+        or not candidate_ids
+        or any(not isinstance(value, str) or not value for value in candidate_ids)
+        or candidate_ids != sorted(set(candidate_ids))
+    ):
+        raise _invalid("P0 candidate ID list is empty or malformed")
+    if candidate_set.get("membership_digest") != _digest(candidate_ids):
         raise _invalid("P0 candidate-set membership digest does not reproduce")
-    candidate_ids = [record.get("opaque_learnware_id") for record in records]
-    if candidate_set.get("candidate_ids") != candidate_ids:
-        raise _invalid("P0 candidate ID list disagrees with its frozen records")
-    matches = [
-        record
-        for record in records
-        if isinstance(record, dict)
-        and record.get("opaque_learnware_id") == candidate_id
-    ]
-    if len(matches) != 1:
-        raise _invalid("candidate_id is absent or duplicated in the P0 TASK_5 block")
-    record = matches[0]
-    if record.get("task_id") != task_id:
-        raise _invalid("P0 candidate task differs from the target context task")
-    return context, record
+    if candidate_id not in candidate_ids:
+        raise _invalid("candidate_id is absent from the P0 TASK_5 block")
+
+    expected_registry_sha256 = _require_sha256(
+        expected_registry_sha256, "expected deployment registry SHA-256"
+    )
+    supplied_registry = Path(registry_path)
+    if not supplied_registry.is_absolute() or supplied_registry.is_symlink():
+        raise _invalid("deployment registry must be an absolute, non-symlink file")
+    try:
+        registry_digest = sha256_file(supplied_registry)
+    except OSError as exc:
+        raise _invalid(f"deployment registry is unreadable: {exc}") from exc
+    if registry_digest != expected_registry_sha256:
+        raise _invalid("deployment registry digest mismatch")
+    try:
+        input_authority = census["input_authority"][str(supplied_registry)]
+    except (KeyError, TypeError) as exc:
+        raise _invalid("P0 census does not bind the deployment registry") from exc
+    if (
+        not isinstance(input_authority, Mapping)
+        or input_authority.get("actual_sha256") != expected_registry_sha256
+        or input_authority.get("expected_sha256") != expected_registry_sha256
+        or input_authority.get("status") != "PASS"
+    ):
+        raise _invalid("P0 deployment registry authority differs")
+    registry = _read_json_object(supplied_registry, "deployment registry")
+    entries = registry.get("entries")
+    if (
+        registry.get("schema") != DEPLOYMENT_PRIVATE_REGISTRY_SCHEMA
+        or not isinstance(entries, Mapping)
+    ):
+        raise _invalid("deployment registry schema or entries are invalid")
+    record = entries.get(candidate_id)
+    if (
+        not isinstance(record, Mapping)
+        or record.get("opaque_learnware_id") != candidate_id
+        or record.get("bundle_digest") is None
+        or not isinstance(record.get("execution_abi"), Mapping)
+    ):
+        raise _invalid("deployment registry candidate entry differs")
+    return context, dict(record)
 
 
 @dataclass(frozen=True, slots=True)
@@ -899,6 +939,8 @@ class ActorAuthority:
         expected_sha256: str,
         census_path: str | Path,
         expected_census_sha256: str,
+        registry_path: str | Path,
+        expected_registry_sha256: str,
         context_id: str,
         candidate_id: str,
     ) -> "ActorAuthority":
@@ -986,7 +1028,13 @@ class ActorAuthority:
             raise _invalid(f"P0 census is unreadable: {exc}") from exc
         if not isinstance(census, dict) or census.get("schema") != P0_CENSUS_SCHEMA:
             raise _invalid("P0 census schema is missing or unsupported")
-        context, record = _candidate_record(census, context_id, candidate_id)
+        context, record = _candidate_record(
+            census,
+            context_id,
+            candidate_id,
+            registry_path=registry_path,
+            expected_registry_sha256=expected_registry_sha256,
+        )
         execution_abi = payload["execution_abi"]
         if not isinstance(execution_abi, Mapping) or dict(execution_abi) != record.get("execution_abi"):
             raise _invalid("actor authority execution ABI differs from the P0 candidate record")

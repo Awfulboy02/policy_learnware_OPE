@@ -767,6 +767,10 @@ def test_real_smoke_seals_three_methods_with_crn_and_resumes_without_reexecution
             "actors": {
                 "fpo_checkout": str(tmp_path / "fpo-v03"),
                 "policy_repo_checkout": str(tmp_path / "actor-v03"),
+                "deployment_private_registry_path": str(
+                    tmp_path / "deployment_private_registry.json"
+                ),
+                "deployment_private_registry_sha256": "9" * 64,
                 "candidates": {
                     candidate_id: {
                         "authority_path": str(tmp_path / f"{candidate_id}.json"),

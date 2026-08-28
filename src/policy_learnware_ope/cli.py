@@ -557,8 +557,18 @@ def _read_real_smoke_config(
     _real_smoke_digest(dataset["p0_census_sha256"], "P0 census digest")
     actors = _real_smoke_exact_keys(
         config["actors"],
-        {"fpo_checkout", "policy_repo_checkout", "candidates"},
+        {
+            "fpo_checkout",
+            "policy_repo_checkout",
+            "deployment_private_registry_path",
+            "deployment_private_registry_sha256",
+            "candidates",
+        },
         "actors",
+    )
+    _real_smoke_digest(
+        actors["deployment_private_registry_sha256"],
+        "deployment private registry digest",
     )
     candidates = actors["candidates"]
     if not isinstance(candidates, Mapping) or len(candidates) != 5:
@@ -839,6 +849,9 @@ def run_real_smoke(
             ]
             for candidate_id in candidate_ids
         },
+        "deployment_private_registry_sha256": actors_config[
+            "deployment_private_registry_sha256"
+        ],
         "raw": {
             "authority_sha256": raw_config["authority_sha256"],
             "block_size": raw_config["block_size"],
@@ -1032,6 +1045,10 @@ def run_real_smoke(
                 expected_sha256=record["authority_sha256"],
                 census_path=config["dataset"]["p0_census_path"],
                 expected_census_sha256=config["dataset"]["p0_census_sha256"],
+                registry_path=actors_config["deployment_private_registry_path"],
+                expected_registry_sha256=actors_config[
+                    "deployment_private_registry_sha256"
+                ],
                 context_id=protocol["context_id"],
                 candidate_id=candidate_id,
             )
@@ -1253,6 +1270,10 @@ def run_real_smoke(
             expected_sha256=record["authority_sha256"],
             census_path=config["dataset"]["p0_census_path"],
             expected_census_sha256=config["dataset"]["p0_census_sha256"],
+            registry_path=actors_config["deployment_private_registry_path"],
+            expected_registry_sha256=actors_config[
+                "deployment_private_registry_sha256"
+            ],
             context_id=protocol["context_id"],
             candidate_id=candidate_id,
         )

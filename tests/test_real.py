@@ -91,7 +91,8 @@ def _write_census(
     bank: Path,
     *,
     candidate_id: str | None = None,
-    candidate_record: dict | None = None,
+    registry_path: Path | None = None,
+    registry_sha256: str | None = None,
 ) -> str:
     bank_sha = sha256_file(bank)
     membership = freeze_membership(CONTEXT_ID, bank_sha)
@@ -114,15 +115,14 @@ def _write_census(
         },
         "split_seed": SPLIT_SEED,
     }
-    if candidate_id is not None and candidate_record is not None:
-        records = [candidate_record]
+    if candidate_id is not None:
+        candidate_ids = [candidate_id]
         freeze["candidate_sets"] = {
             "CheetahRun": {
-                "candidate_ids": [candidate_id],
+                "candidate_ids": candidate_ids,
                 "membership_digest": hashlib.sha256(
-                    _canonical_bytes(records)
+                    _canonical_bytes(candidate_ids)
                 ).hexdigest(),
-                "records": records,
             }
         }
     census = {
@@ -148,6 +148,14 @@ def _write_census(
         "schema": P0_CENSUS_SCHEMA,
         "status": "NO_GO",
     }
+    if registry_path is not None and registry_sha256 is not None:
+        census["input_authority"] = {
+            str(registry_path): {
+                "actual_sha256": registry_sha256,
+                "expected_sha256": registry_sha256,
+                "status": "PASS",
+            }
+        }
     path.write_bytes(_canonical_bytes(census))
     return sha256_file(path)
 
@@ -594,11 +602,22 @@ def _actor_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     bank = tmp_path / "bank.npz"
     census = tmp_path / "p0.json"
     _write_bank(bank)
+    registry = tmp_path / "deployment_private_registry.json"
+    registry.write_bytes(
+        _canonical_bytes(
+            {
+                "schema": "policy-learnware.v03-deployment-private-registry.v0",
+                "entries": {candidate_id: candidate_record},
+            }
+        )
+    )
+    registry_sha = sha256_file(registry)
     census_sha = _write_census(
         census,
         bank,
         candidate_id=candidate_id,
-        candidate_record=candidate_record,
+        registry_path=registry,
+        registry_sha256=registry_sha,
     )
     fpo_source = real_module._checkout_source_identity(fpo)
     authority_payload = {
@@ -639,6 +658,8 @@ def _actor_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         expected_sha256=authority_sha,
         census_path=census,
         expected_census_sha256=census_sha,
+        registry_path=registry,
+        expected_registry_sha256=registry_sha,
         context_id=CONTEXT_ID,
         candidate_id=candidate_id,
     )
@@ -673,6 +694,8 @@ def _actor_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         fpo=fpo,
         loader_calls=loader_calls,
         policy_repo=policy_repo,
+        registry=registry,
+        registry_sha=registry_sha,
         state=state,
     )
 
@@ -796,12 +819,43 @@ def test_actor_authority_and_live_assets_fail_closed(
     common = {
         "census_path": fixture.census,
         "expected_census_sha256": fixture.census_sha,
+        "registry_path": fixture.registry,
+        "expected_registry_sha256": fixture.registry_sha,
         "context_id": CONTEXT_ID,
         "candidate_id": fixture.candidate_id,
     }
     with pytest.raises(DataValidationError, match="authority digest mismatch"):
         ActorAuthority.from_json(
             fixture.authority_path, expected_sha256="0" * 64, **common
+        )
+
+    registry_bytes = fixture.registry.read_bytes()
+    fixture.registry.write_bytes(registry_bytes + b"\n")
+    with pytest.raises(DataValidationError, match="registry digest mismatch"):
+        ActorAuthority.from_json(
+            fixture.authority_path,
+            expected_sha256=fixture.authority_sha,
+            **common,
+        )
+    fixture.registry.write_bytes(registry_bytes)
+
+    untrusted_census = json.loads(fixture.census.read_text(encoding="utf-8"))
+    untrusted_census["input_authority"][str(fixture.registry)]["status"] = (
+        "DECLARED_ONLY"
+    )
+    untrusted_census_path = tmp_path / "untrusted-p0.json"
+    untrusted_census_path.write_bytes(_canonical_bytes(untrusted_census))
+    with pytest.raises(
+        DataValidationError, match="P0 deployment registry authority differs"
+    ):
+        ActorAuthority.from_json(
+            fixture.authority_path,
+            expected_sha256=fixture.authority_sha,
+            **{
+                **common,
+                "census_path": untrusted_census_path,
+                "expected_census_sha256": sha256_file(untrusted_census_path),
+            },
         )
 
     for name, change, message in (
