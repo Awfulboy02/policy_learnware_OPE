@@ -175,6 +175,7 @@ def _verified_source_checkout() -> Path | None:
     expected_cli = candidate / "src" / "policy_learnware_ope" / "cli.py"
     pyproject = candidate / "pyproject.toml"
     try:
+        _reject_symlink_components(pyproject, "source pyproject")
         metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
         project_name = metadata["project"]["name"]
         same_cli = expected_cli.samefile(current_file)
@@ -306,6 +307,18 @@ def _implementation_identity(commit_override: str | None = None) -> dict[str, An
         }
     repository = _verified_source_checkout()
     if repository is None:
+        lexical_file = Path(__file__).absolute()
+        candidate = lexical_file.parents[2]
+        try:
+            source_shaped = (
+                (candidate / ".git").exists()
+                and (candidate / "src" / "policy_learnware_ope" / "cli.py").samefile(lexical_file)
+                and tomllib.loads((candidate / "pyproject.toml").read_text(encoding="utf-8"))["project"]["name"] == "policy-learnware-ope"
+            )
+        except (OSError, KeyError, tomllib.TOMLDecodeError):
+            source_shaped = False
+        if source_shaped:
+            return {"commit": "UNAVAILABLE", "tree": "UNAVAILABLE", "worktree_status": "UNVERIFIED_GIT_SOURCE"}
         return _installed_package_identity()
     try:
         commit = subprocess.run(
