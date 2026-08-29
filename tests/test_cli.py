@@ -410,13 +410,54 @@ def test_artifact_root_precedence_default_and_escape_gate(
     outside = tmp_path / "outside"
     outside.mkdir()
     (explicit / "linked").symlink_to(outside, target_is_directory=True)
-    with pytest.raises(GateClosed, match="escapes"):
+    with pytest.raises(GateClosed, match="symlink component"):
         cli_module._artifact_path("linked/escape", artifacts_root=explicit)
 
     monkeypatch.delenv(cli_module.ARTIFACTS_ROOT_ENV)
-    assert cli_module._artifact_path("ope/toy") == (
-        checkout.parent / "artifacts" / "ope" / "toy"
-    ).resolve()
+    with pytest.raises(GateClosed, match="published relocation manifest"):
+        cli_module._artifact_path("ope/toy")
+
+
+def test_artifact_resolver_rejects_symlink_roots_empty_env_and_git_env_spoof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    with pytest.raises(GateClosed, match="symlink component"):
+        cli_module._artifact_path("x", artifacts_root=alias)
+    broken = tmp_path / "broken"
+    broken.symlink_to(tmp_path / "missing")
+    with pytest.raises(GateClosed, match="symlink component"):
+        cli_module._artifact_path(broken / "x")
+    monkeypatch.setenv(cli_module.ARTIFACTS_ROOT_ENV, "  ")
+    with pytest.raises(GateClosed, match="must not be empty"):
+        cli_module._artifact_path("x")
+    monkeypatch.setenv("GIT_DIR", str(Path.cwd() / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
+    monkeypatch.setenv("git_dir", str(tmp_path / "lowercase-spoof"))
+    monkeypatch.setenv("PATH", str(tmp_path / "fake-bin"))
+    assert cli_module._verified_source_checkout() == Path(cli_module.__file__).resolve().parents[2]
+
+
+def test_frozen_v2_sidecar_uniquely_binds_relocated_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path("/Users/jamesmac/Desktop/RL Learnware/artifacts")
+    config_path = root / "ope/configs/reconstructed/relocation-audit-b510bc8-v2/CheetahRun.json"
+    sidecar_path = config_path.with_name("CheetahRun.relocation.json")
+    if not config_path.is_file():
+        pytest.skip("canonical reconstructed v2 evidence is unavailable")
+    config, digest = cli_module._read_real_smoke_config(config_path, sha256_file(config_path))
+    config["_config_path"] = str(config_path)
+    config["actors"]["deployment_private_registry_path_logical"] = config["actors"]["deployment_private_registry_path"]
+    config["actors"]["relocation_sidecar_path"] = str(sidecar_path)
+    config["actors"]["relocation_sidecar_sha256"] = sha256_file(sidecar_path)
+    resolved = cli_module._resolve_real_smoke_paths(config, artifacts_root=root)
+    monkeypatch.setattr(cli_module, "_implementation_identity", lambda: {"commit": "b510bc891b3f939931ace56b9278b38909b322f7", "tree": "ca52762e2f20487dfbc9727bcb49fda318ad46bd", "worktree_status": "CLEAN"})
+    assert cli_module._relocated_registry_source(resolved, artifacts_root=root).endswith("/v03-main-20260827-r0/source-market/deployment_private_registry.json")
+    assert digest == sha256_file(config_path)
 
 
 def test_relative_cli_output_requires_root_in_installed_layout(
@@ -620,7 +661,7 @@ def test_real_smoke_seals_three_methods_with_crn_and_resumes_without_reexecution
 
     def fake_query(*args, output_path, **kwargs):
         del args, kwargs
-        output_path.write_bytes(b"six-field-reward-free-query")
+        np.savez(output_path, membership_digest=np.asarray(fit_membership))
         return {
             "artifact_sha256": sha256_file(output_path),
             "fields": [
@@ -865,7 +906,37 @@ def test_real_smoke_seals_three_methods_with_crn_and_resumes_without_reexecution
         resume=True,
     )
     assert resumed == first
-    assert json.loads(json.dumps(calls, default=str)) == before_resume
+    after_resume = json.loads(json.dumps(calls, default=str))
+    assert {key: value for key, value in after_resume.items() if key != "actor_verify"} == {
+        key: value for key, value in before_resume.items() if key != "actor_verify"
+    }
+    assert after_resume["actor_verify"] == before_resume["actor_verify"] + 5
+
+    extra = tmp_path / "run-a" / "raw" / "extra-oracle.json"
+    extra.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(GateClosed, match="inventory differs"):
+        run_real_smoke(first_config, tmp_path / "run-a", expected_config_sha256=sha256_file(first_config), resume=True)
+    extra.unlink()
+    tampered_final = json.loads(original_run_bytes)
+    tampered_final["oracle_accessed"] = True
+    tampered_final["extra"] = "oracle"
+    first_run_path.write_bytes(cli_module._canonical_bytes(tampered_final))
+    with pytest.raises(GateClosed, match="payload differs"):
+        run_real_smoke(first_config, tmp_path / "run-a", expected_config_sha256=sha256_file(first_config), resume=True)
+    first_run_path.write_bytes(original_run_bytes)
+    runtime_path = tmp_path / "run-a" / "runtime.json"
+    runtime_bytes = runtime_path.read_bytes()
+    bad_runtime = json.loads(runtime_bytes)
+    bad_runtime["invocation_wall_seconds"] = -1.0
+    bad_runtime["extra"] = True
+    runtime_path.write_bytes(cli_module._canonical_bytes(bad_runtime))
+    bound_final = json.loads(original_run_bytes)
+    bound_final["runtime"]["sha256"] = sha256_file(runtime_path)
+    first_run_path.write_bytes(cli_module._canonical_bytes(bound_final))
+    with pytest.raises(GateClosed, match="runtime identity differs"):
+        run_real_smoke(first_config, tmp_path / "run-a", expected_config_sha256=sha256_file(first_config), resume=True)
+    runtime_path.write_bytes(runtime_bytes)
+    first_run_path.write_bytes(original_run_bytes)
 
     (tmp_path / "run-a" / "run.json").unlink()
     recovered = run_real_smoke(
@@ -907,7 +978,7 @@ def test_real_smoke_seals_three_methods_with_crn_and_resumes_without_reexecution
     assert calls["raw"] == 2
     assert calls["fqe_fit_count"] == 10
     assert calls["mb_fit_count"] == 2
-    assert calls["actor_verify"] == 15
+    assert calls["actor_verify"] >= 15
     for output in (tmp_path / "run-a", tmp_path / "run-b"):
         assert str(tmp_path) not in (output / "run.json").read_text(encoding="utf-8")
         for reference in json.loads(

@@ -835,6 +835,7 @@ def _candidate_record(
     *,
     registry_path: str | Path,
     expected_registry_sha256: str,
+    relocated_registry_source_path: str | Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         bank_rows = census["asset_facts"]["banks"]["full_rows"]
@@ -881,27 +882,21 @@ def _candidate_record(
         raise _invalid("deployment registry digest mismatch")
     try:
         input_authorities = census["input_authority"]
-        input_authority = input_authorities.get(str(supplied_registry))
+        if not isinstance(input_authorities, Mapping):
+            raise TypeError("input_authority is not a mapping")
+        authority_key = (
+            str(supplied_registry)
+            if relocated_registry_source_path is None
+            else str(relocated_registry_source_path)
+        )
+        if not Path(authority_key).is_absolute():
+            raise TypeError("input authority key is not absolute")
+        input_authority = input_authorities.get(authority_key)
     except (KeyError, TypeError, AttributeError) as exc:
         raise _invalid("P0 census does not bind the deployment registry") from exc
-    if input_authority is None:
-        digest_matches = [
-            record
-            for original_path, record in input_authorities.items()
-            if isinstance(original_path, str)
-            and Path(original_path).is_absolute()
-            and isinstance(record, Mapping)
-            and record.get("actual_sha256") == expected_registry_sha256
-            and record.get("expected_sha256") == expected_registry_sha256
-            and record.get("status") == "PASS"
-        ]
-        if len(digest_matches) != 1:
-            raise _invalid(
-                "P0 census does not uniquely bind the relocated deployment registry"
-            )
-        input_authority = digest_matches[0]
     if (
         not isinstance(input_authority, Mapping)
+        or set(input_authority) != {"actual_sha256", "expected_sha256", "status"}
         or input_authority.get("actual_sha256") != expected_registry_sha256
         or input_authority.get("expected_sha256") != expected_registry_sha256
         or input_authority.get("status") != "PASS"
@@ -958,6 +953,7 @@ class ActorAuthority:
         expected_census_sha256: str,
         registry_path: str | Path,
         expected_registry_sha256: str,
+        relocated_registry_source_path: str | Path | None = None,
         context_id: str,
         candidate_id: str,
     ) -> "ActorAuthority":
@@ -1051,6 +1047,7 @@ class ActorAuthority:
             candidate_id,
             registry_path=registry_path,
             expected_registry_sha256=expected_registry_sha256,
+            relocated_registry_source_path=relocated_registry_source_path,
         )
         execution_abi = payload["execution_abi"]
         if not isinstance(execution_abi, Mapping) or dict(execution_abi) != record.get("execution_abi"):

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -77,6 +78,64 @@ REAL_SMOKE_CONFIG_SCHEMA = "policy-learnware.ope.real-smoke-config.v1"
 REAL_SMOKE_STAGE_SCHEMA = "policy-learnware.ope.real-smoke-stage.v1"
 REAL_SMOKE_RUN_SCHEMA = "policy-learnware.ope.real-smoke-run.v1"
 ARTIFACTS_ROOT_ENV = "RL_LEARNWARE_ARTIFACTS_ROOT"
+SYSTEM_GIT = "/usr/bin/git"
+RELOCATION_MANIFEST_SHA256 = "81e726c297c78ebc110df017e06e6fb56de73face39371198635299f931bfed9"
+RELOCATION_MANIFEST_SCHEMA = "rl-learnware-relocation/v1"
+
+
+def _git_clean_env() -> dict[str, str]:
+    return {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+
+
+def _artifact_root_error(detail: str) -> GateClosed:
+    return GateClosed("NO_GO_ARTIFACT_ROOT", detail)
+
+
+def _reject_symlink_components(path: Path, where: str) -> None:
+    absolute = path.expanduser()
+    if not absolute.is_absolute():
+        raise _artifact_root_error(f"{where} must be an absolute path")
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise _artifact_root_error(
+                f"{where} path component is not auditable: {current}"
+            ) from exc
+        if current.is_symlink():
+            raise _artifact_root_error(
+                f"{where} must not contain a symlink component: {current}"
+            )
+
+
+def _validate_relocation_manifest(root: Path) -> dict[str, Any]:
+    manifest = root / "relocation_manifest.json"
+    _reject_symlink_components(manifest, "fallback relocation manifest")
+    try:
+        raw = manifest.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _artifact_root_error(
+            "fallback artifacts root lacks the published relocation manifest"
+        ) from exc
+    if sha256(raw).hexdigest() != RELOCATION_MANIFEST_SHA256:
+        raise _artifact_root_error(
+            "fallback relocation manifest digest differs from the published manifest"
+        )
+    if not isinstance(payload, dict) or set(payload) != {"schema", "mappings"}:
+        raise _artifact_root_error("fallback relocation manifest fields differ")
+    mappings = payload["mappings"]
+    if payload["schema"] != RELOCATION_MANIFEST_SCHEMA or not isinstance(mappings, list):
+        raise _artifact_root_error("fallback relocation manifest schema differs")
+    required = {"kind", "source", "target", "content_manifest_sha256", "file_count", "total_bytes", "role", "access_class", "status"}
+    optional = {"completeness", "known_missing"}
+    if any(not isinstance(row, dict) or not required <= set(row) or set(row) - required - optional for row in mappings):
+        raise _artifact_root_error("fallback relocation manifest mapping fields differ")
+    return payload
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -143,7 +202,7 @@ def _containing_git_root(path: Path) -> Path | None:
             try:
                 bare = subprocess.run(
                     [
-                        "git",
+                        SYSTEM_GIT,
                         f"--git-dir={candidate}",
                         "config",
                         "--bool",
@@ -151,6 +210,7 @@ def _containing_git_root(path: Path) -> Path | None:
                         "core.bare",
                     ],
                     check=False,
+                    env=_git_clean_env(),
                     text=True,
                     capture_output=True,
                 )
@@ -166,7 +226,12 @@ def _containing_git_root(path: Path) -> Path | None:
 def _verified_source_checkout() -> Path | None:
     """Return this package's Git root only for the canonical src layout."""
 
-    current_file = Path(__file__).resolve()
+    lexical_file = Path(__file__).absolute()
+    try:
+        _reject_symlink_components(lexical_file, "package source")
+    except GateClosed:
+        return None
+    current_file = lexical_file.resolve()
     candidate = current_file.parents[2]
     expected_cli = candidate / "src" / "policy_learnware_ope" / "cli.py"
     pyproject = candidate / "pyproject.toml"
@@ -176,17 +241,41 @@ def _verified_source_checkout() -> Path | None:
         same_cli = expected_cli.samefile(current_file)
     except (OSError, KeyError, tomllib.TOMLDecodeError):
         return None
-    if not (candidate / ".git").exists() or project_name != "policy-learnware-ope":
+    if project_name != "policy-learnware-ope" or not same_cli:
         return None
-    return candidate if same_cli else None
+    if not (candidate / ".git").is_dir():
+        return None
+    commands = (
+        [SYSTEM_GIT, "rev-parse", "--show-toplevel"],
+        [SYSTEM_GIT, "rev-parse", "--verify", "HEAD^{commit}"],
+        [SYSTEM_GIT, "ls-files", "--error-unmatch", "pyproject.toml"],
+        [SYSTEM_GIT, "diff", "--quiet", "HEAD", "--", "pyproject.toml"],
+        [SYSTEM_GIT, "diff", "--cached", "--quiet", "HEAD", "--", "pyproject.toml"],
+        [SYSTEM_GIT, "status", "--porcelain", "--", "pyproject.toml", "src/policy_learnware_ope"],
+    )
+    try:
+        results = [subprocess.run(command, cwd=candidate, env=_git_clean_env(), check=False, text=True, capture_output=True) for command in commands]
+    except OSError:
+        return None
+    if any(result.returncode != 0 for result in results):
+        return None
+    if results[-1].stdout:
+        return None
+    try:
+        top = Path(results[0].stdout.strip()).resolve(strict=True)
+    except (OSError, ValueError):
+        return None
+    return candidate if top == candidate.resolve() else None
 
 
 def _artifacts_root(explicit_root: str | Path | None = None) -> Path:
     """Resolve the one external artifact root without trusting foreign layouts."""
 
     configured = explicit_root
-    if configured is None:
-        configured = os.environ.get(ARTIFACTS_ROOT_ENV)
+    if configured is None and ARTIFACTS_ROOT_ENV in os.environ:
+        configured = os.environ[ARTIFACTS_ROOT_ENV]
+        if not str(configured).strip():
+            raise _artifact_root_error(f"{ARTIFACTS_ROOT_ENV} must not be empty")
     if configured is not None:
         root = Path(configured).expanduser()
         if not root.is_absolute():
@@ -194,6 +283,7 @@ def _artifacts_root(explicit_root: str | Path | None = None) -> Path:
                 "NO_GO_ARTIFACT_ROOT",
                 f"{ARTIFACTS_ROOT_ENV} and --artifacts-root must be absolute",
             )
+        _reject_symlink_components(root, "artifacts root")
         return root.resolve()
     repository = _verified_source_checkout()
     if repository is None:
@@ -202,7 +292,10 @@ def _artifacts_root(explicit_root: str | Path | None = None) -> Path:
             "installed or foreign layouts require --artifacts-root or "
             f"{ARTIFACTS_ROOT_ENV}",
         )
-    return (repository.parent / "artifacts").resolve()
+    root = repository.parent / "artifacts"
+    _reject_symlink_components(root, "fallback artifacts root")
+    _validate_relocation_manifest(root)
+    return root.resolve()
 
 
 def _artifact_path(
@@ -214,9 +307,12 @@ def _artifact_path(
 
     candidate = Path(path).expanduser()
     if candidate.is_absolute():
+        _reject_symlink_components(candidate, "artifact path")
         return candidate.resolve()
     root = _artifacts_root(artifacts_root)
-    resolved = (root / candidate).resolve()
+    lexical = root / candidate
+    _reject_symlink_components(lexical, "artifact path")
+    resolved = lexical.resolve()
     try:
         resolved.relative_to(root)
     except ValueError as exc:
@@ -288,25 +384,28 @@ def _implementation_identity(commit_override: str | None = None) -> dict[str, An
         return _installed_package_identity()
     try:
         commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            [SYSTEM_GIT, "rev-parse", "HEAD"],
             cwd=repository,
             check=True,
             text=True,
             capture_output=True,
+            env=_git_clean_env(),
         ).stdout.strip()
         tree = subprocess.run(
-            ["git", "rev-parse", "HEAD^{tree}"],
+            [SYSTEM_GIT, "rev-parse", "HEAD^{tree}"],
             cwd=repository,
             check=True,
             text=True,
             capture_output=True,
+            env=_git_clean_env(),
         ).stdout.strip()
         worktree = subprocess.run(
-            ["git", "status", "--porcelain"],
+            [SYSTEM_GIT, "status", "--porcelain"],
             cwd=repository,
             check=True,
             text=True,
             capture_output=True,
+            env=_git_clean_env(),
         ).stdout
         return {
             "commit": commit,
@@ -604,21 +703,23 @@ def _read_real_smoke_config(
         config["dataset"], {"p0_census_path", "p0_census_sha256", "bank_path"}, "dataset"
     )
     _real_smoke_digest(dataset["p0_census_sha256"], "P0 census digest")
-    actors = _real_smoke_exact_keys(
-        config["actors"],
-        {
+    actor_base = {
             "fpo_checkout",
             "policy_repo_checkout",
             "deployment_private_registry_path",
             "deployment_private_registry_sha256",
             "candidates",
-        },
-        "actors",
-    )
+    }
+    observed_actor_keys = frozenset(config["actors"]) if isinstance(config["actors"], Mapping) else frozenset()
+    if observed_actor_keys not in {frozenset(actor_base), frozenset(actor_base | {"relocation_sidecar_path", "relocation_sidecar_sha256"})}:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "actors fields differ from the real-smoke schema")
+    actors = config["actors"]
     _real_smoke_digest(
         actors["deployment_private_registry_sha256"],
         "deployment private registry digest",
     )
+    if "relocation_sidecar_sha256" in actors:
+        _real_smoke_digest(actors["relocation_sidecar_sha256"], "relocation sidecar digest")
     candidates = actors["candidates"]
     if not isinstance(candidates, Mapping) or len(candidates) != 5:
         raise GateClosed(
@@ -692,6 +793,8 @@ def _resolve_real_smoke_paths(
         "deployment_private_registry_path",
     ):
         actors[key] = str(_artifact_path(actors[key], artifacts_root=artifacts_root))
+    if "relocation_sidecar_path" in actors:
+        actors["relocation_sidecar_path"] = str(_artifact_path(actors["relocation_sidecar_path"], artifacts_root=artifacts_root))
     actors["candidates"] = {
         candidate_id: {
             **dict(record),
@@ -717,6 +820,71 @@ def _resolve_real_smoke_paths(
         raw[key] = str(_artifact_path(raw[key], artifacts_root=artifacts_root))
     resolved["raw"] = raw
     return resolved
+
+
+def _relocated_registry_source(
+    config: Mapping[str, Any], *, artifacts_root: str | Path | None
+) -> str | None:
+    """Bind the relocated registry to its one declared old-source mapping."""
+
+    actors = config["actors"]
+    if "relocation_sidecar_path" not in actors:
+        return None
+    sidecar_path = Path(actors["relocation_sidecar_path"])
+    expected = _real_smoke_digest(
+        actors["relocation_sidecar_sha256"], "relocation sidecar digest"
+    )
+    try:
+        raw = sidecar_path.read_bytes()
+        sidecar = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "relocation sidecar is unreadable") from exc
+    if sha256(raw).hexdigest() != expected:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "relocation sidecar digest mismatch")
+    top = {"schema", "classification", "root_manifest", "source_config", "reconstructed_config", "implementation", "verified_source_checkouts", "execution", "scientific_status"}
+    if not isinstance(sidecar, Mapping) or set(sidecar) != top:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "relocation sidecar fields differ")
+    if sidecar["schema"] != "policy-learnware.ope.reconstructed-relocation-config.v1" or sidecar["classification"] != "RECONSTRUCTED_RELOCATION_CONFIG":
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "relocation sidecar identity differs")
+    implementation_record = _real_smoke_exact_keys(sidecar["implementation"], {"classification", "commit", "tree"}, "sidecar implementation")
+    current_implementation = _implementation_identity()
+    if implementation_record["classification"] != "RECONSTRUCTED_SOURCE_CHECKOUT" or implementation_record["commit"] != current_implementation.get("commit") or implementation_record["tree"] != current_implementation.get("tree"):
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "relocation sidecar implementation binding differs")
+    root_record = _real_smoke_exact_keys(sidecar["root_manifest"], {"logical_path", "schema", "sha256"}, "sidecar root manifest")
+    if root_record != {"logical_path": "relocation_manifest.json", "schema": RELOCATION_MANIFEST_SCHEMA, "sha256": RELOCATION_MANIFEST_SHA256}:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "sidecar root manifest binding differs")
+    reconstructed = _real_smoke_exact_keys(sidecar["reconstructed_config"], {"logical_path", "path_mappings", "sha256"}, "sidecar reconstructed config")
+    if reconstructed["sha256"] != sha256_file(Path(config["_config_path"])):
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "sidecar reconstructed config digest differs")
+    matches = [row for row in reconstructed["path_mappings"] if isinstance(row, Mapping) and row.get("field") == "actors.deployment_private_registry_path"] if isinstance(reconstructed["path_mappings"], list) else []
+    if len(matches) != 1 or set(matches[0]) != {"field", "source", "target"}:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "sidecar registry mapping is not unique and exact")
+    mapping = matches[0]
+    target = str(actors["deployment_private_registry_path_logical"])
+    if mapping["target"] != target or not isinstance(mapping["source"], str) or not Path(mapping["source"]).is_absolute():
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "sidecar registry mapping scope differs")
+    root = _artifacts_root(artifacts_root)
+    manifest = _validate_relocation_manifest(root)
+    candidates = []
+    source_file = Path(mapping["source"])
+    for row in manifest["mappings"]:
+        if row["kind"] != "prefix" or row["status"] != "verified" or not Path(row["source"]).is_absolute():
+            continue
+        try:
+            suffix = source_file.relative_to(Path(row["source"]))
+        except ValueError:
+            continue
+        if suffix.is_absolute() or ".." in suffix.parts:
+            continue
+        if (Path(row["target"]) / suffix).as_posix() == mapping["target"]:
+            candidates.append((len(Path(row["source"]).parts), row))
+    if not candidates:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "sidecar registry mapping is absent from the published manifest")
+    longest = max(length for length, _row in candidates)
+    bound = [row for length, row in candidates if length == longest]
+    if len(bound) != 1 or set(bound[0]) != {"kind", "source", "target", "content_manifest_sha256", "file_count", "total_bytes", "role", "access_class", "status"}:
+        raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "sidecar registry mapping is ambiguous or malformed")
+    return str(mapping["source"])
 
 
 def _real_smoke_p0_identity(
@@ -814,6 +982,26 @@ def _real_smoke_stage(
             or not isinstance(stage.get("artifacts"), Mapping)
         ):
             raise GateClosed("NO_GO_ASSET_ABI", f"{name} stage identity mismatch")
+        stage_keys = {
+            "data": {"schema", "stage", "config_sha256", "artifacts", "bank_sha256", "export_manifest_sha256", "fit_membership_sha256", "validation_membership_sha256", "s0_membership_sha256", "query_sha256", "transition_count"},
+            "raw": {"schema", "stage", "config_sha256", "artifacts", "method_id", "ranking", "seal_sha256", "selected_candidate_id", "status"},
+            "fqe": {"schema", "stage", "config_sha256", "artifacts", "method_id", "ranking", "seal_sha256", "selected_candidate_id", "statuses", "all_candidates_pass"},
+            "mbff": {"schema", "stage", "config_sha256", "artifacts", "method_id", "ranking", "seal_sha256", "selected_candidate_id", "statuses", "all_candidates_pass"},
+        }[name]
+        if set(stage) != stage_keys:
+            raise GateClosed("NO_GO_ASSET_ABI", f"{name} stage fields differ")
+        expected_files = {"stage.json", *(str(value) for value in stage["artifacts"])}
+        observed_files: set[str] = set()
+        for entry in destination.rglob("*"):
+            relative = entry.relative_to(destination).as_posix()
+            if entry.is_symlink() or (not entry.is_file() and not entry.is_dir()):
+                raise GateClosed("NO_GO_ASSET_ABI", f"{name} stage inventory contains an unsafe entry")
+            if entry.is_file():
+                observed_files.add(relative)
+        expected_dirs = {str(Path(value).parent).replace(".", "") for value in expected_files if Path(value).parent != Path(".")}
+        observed_dirs = {entry.relative_to(destination).as_posix() for entry in destination.rglob("*") if entry.is_dir()}
+        if observed_files != expected_files or observed_dirs != expected_dirs:
+            raise GateClosed("NO_GO_ASSET_ABI", f"{name} stage inventory differs")
         for relative, digest in stage["artifacts"].items():
             artifact = destination / str(relative)
             if (
@@ -824,6 +1012,13 @@ def _real_smoke_stage(
                 or sha256_file(artifact) != digest
             ):
                 raise GateClosed("NO_GO_ASSET_ABI", f"{name} stage artifact mismatch")
+        try:
+            stage_runtime = json.loads((destination / "runtime.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise GateClosed("NO_GO_ASSET_ABI", f"{name} runtime is unreadable") from exc
+        if not isinstance(stage_runtime, Mapping) or set(stage_runtime) != {"schema", "stage", "wall_seconds", "peak_rss_bytes"} or stage_runtime.get("schema") != "policy-learnware.ope.real-smoke-runtime.v1" or stage_runtime.get("stage") != name:
+            raise GateClosed("NO_GO_ASSET_ABI", f"{name} runtime fields differ")
+        _validate_runtime_numbers(stage_runtime, ("wall_seconds", "peak_rss_bytes"))
         return dict(stage)
 
     temporary = Path(tempfile.mkdtemp(prefix=f".{name}.partial-", dir=root))
@@ -839,6 +1034,28 @@ def _real_smoke_stage(
     _write_canonical_json(temporary / "stage.json", stage)
     os.rename(temporary, destination)
     return stage
+
+
+def _verify_resume_root_inventory(root: Path) -> None:
+    if not root.exists():
+        return
+    _reject_symlink_components(root, "real-smoke output")
+    allowed_files = {"config.lock.json", "run.json", "runtime.json"}
+    allowed_dirs = {"data", "raw", "fqe", "mbff"}
+    for entry in root.iterdir():
+        if entry.is_symlink() or (not entry.is_file() and not entry.is_dir()):
+            raise GateClosed("NO_GO_ASSET_ABI", "real-smoke root contains an unsafe entry")
+        if entry.is_file() and entry.name not in allowed_files:
+            raise GateClosed("NO_GO_ASSET_ABI", "real-smoke root inventory differs")
+        if entry.is_dir() and entry.name not in allowed_dirs:
+            raise GateClosed("NO_GO_ASSET_ABI", "real-smoke root inventory differs")
+
+
+def _validate_runtime_numbers(runtime: Mapping[str, Any], fields: Sequence[str]) -> None:
+    for field in fields:
+        value = runtime.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise GateClosed("NO_GO_ASSET_ABI", f"runtime {field} is invalid")
 
 
 def _raw_subprocess_entry(
@@ -911,11 +1128,40 @@ def run_real_smoke(
     config, config_sha256 = _read_real_smoke_config(
         config_path, expected_config_sha256
     )
+    if "relocation_sidecar_path" not in config["actors"]:
+        adjacent = config_path.with_name(f"{config_path.stem}.relocation.json")
+        alternatives = list(config_path.parent.glob(f"{config_path.stem}*.relocation.json"))
+        if alternatives:
+            if alternatives != [adjacent] or adjacent.is_symlink() or not adjacent.is_file():
+                raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "adjacent relocation sidecar is ambiguous or unsafe")
+            config["actors"]["relocation_sidecar_path"] = str(adjacent)
+            config["actors"]["relocation_sidecar_sha256"] = sha256_file(adjacent)
+    config["_config_path"] = str(config_path)
+    config["actors"]["deployment_private_registry_path_logical"] = config["actors"][
+        "deployment_private_registry_path"
+    ]
     config = _resolve_real_smoke_paths(config, artifacts_root=artifacts_root)
     candidate_ids, bank_sha256, frozen_membership = _real_smoke_p0_identity(config)
     protocol = config["protocol"]
     actors_config = config["actors"]
     raw_config = config["raw"]
+    relocated_registry_source = _relocated_registry_source(
+        config, artifacts_root=artifacts_root
+    )
+    verified_authorities = {}
+    for candidate_id in candidate_ids:
+        record = actors_config["candidates"][candidate_id]
+        verified_authorities[candidate_id] = ActorAuthority.from_json(
+            record["authority_path"],
+            expected_sha256=record["authority_sha256"],
+            census_path=config["dataset"]["p0_census_path"],
+            expected_census_sha256=config["dataset"]["p0_census_sha256"],
+            registry_path=actors_config["deployment_private_registry_path"],
+            expected_registry_sha256=actors_config["deployment_private_registry_sha256"],
+            relocated_registry_source_path=relocated_registry_source,
+            context_id=protocol["context_id"],
+            candidate_id=candidate_id,
+        )
     implementation = _implementation_identity()
     if implementation["worktree_status"] not in {
         "CLEAN",
@@ -951,6 +1197,7 @@ def run_real_smoke(
         "deployment_private_registry_sha256": actors_config[
             "deployment_private_registry_sha256"
         ],
+        "relocation_sidecar_sha256": actors_config.get("relocation_sidecar_sha256", "NOT_RELOCATED"),
         "raw": {
             "authority_sha256": raw_config["authority_sha256"],
             "block_size": raw_config["block_size"],
@@ -961,6 +1208,7 @@ def run_real_smoke(
     }
     normalized_config_sha256 = _payload_digest(normalized_config)
     destination = _guard_output_location(output, artifacts_root=artifacts_root)
+    _verify_resume_root_inventory(destination)
     if destination.exists() and not destination.is_dir():
         raise FileExistsError(f"real-smoke output is not a directory: {destination}")
     if destination.exists() and any(destination.iterdir()) and not resume:
@@ -1058,10 +1306,24 @@ def run_real_smoke(
                 or sealed.payload["candidate_set_digest"]
                 != candidate_set_digest(candidate_ids)
                 or sealed.payload["ranking"] != stage.get("ranking")
+                or sealed.payload["selected_candidate_id"] != stage.get("selected_candidate_id")
             ):
                 raise GateClosed(
                     "NO_GO_ASSET_ABI", f"{stage_name} ranking binding differs"
                 )
+            row_statuses = {row["candidate_id"]: row.get("status") for row in sealed.payload["rows"]}
+            if stage_name == "raw":
+                scores = json.loads((destination / "raw" / "scores.json").read_text(encoding="utf-8"))
+                sealed_scores = {row["candidate_id"]: row["score"] for row in sealed.payload["rows"]}
+                if stage.get("status") != "PASS" or scores != sealed_scores:
+                    raise GateClosed("NO_GO_ASSET_ABI", "raw stage score/status binding differs")
+            else:
+                estimates = json.loads((destination / stage_name / "estimates.json").read_text(encoding="utf-8"))
+                estimate_statuses = {key: value.get("status") for key, value in estimates.items()}
+                estimate_scores = {key: value.get("value") for key, value in estimates.items()}
+                sealed_scores = {row["candidate_id"]: row["score"] for row in sealed.payload["rows"]}
+                if stage.get("statuses") != row_statuses or estimate_statuses != row_statuses or estimate_scores != sealed_scores or stage.get("all_candidates_pass") is not all(value == "PASS" for value in row_statuses.values()):
+                    raise GateClosed("NO_GO_ASSET_ABI", f"{stage_name} stage estimate/status binding differs")
             expected_rankings[method_id] = list(sealed.payload["ranking"])
             expected_seal_references[method_id] = {
                 "path": seal_relative,
@@ -1089,6 +1351,21 @@ def run_real_smoke(
             ],
             "query_sha256": verified_stages["data"]["query_sha256"],
         }
+        try:
+            export_manifest = json.loads((destination / "data" / "transitions" / "manifest.json").read_text(encoding="utf-8"))
+            query_membership = str(np.load(destination / "data" / "raw-query.npz", allow_pickle=False)["membership_digest"].item())
+        except (OSError, KeyError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            raise GateClosed("NO_GO_ASSET_ABI", "data stage manifest/query binding is unreadable") from exc
+        if (
+            export_manifest.get("source", {}).get("bank_sha256") != bank_sha256
+            or export_manifest.get("context", {}).get("context_id") != protocol["context_id"]
+            or export_manifest.get("context", {}).get("task_id") != protocol["task_id"]
+            or export_manifest.get("splits", {}).get("fit", {}).get("membership_digest") != expected_data_summary["fit_membership_sha256"]
+            or export_manifest.get("splits", {}).get("validation", {}).get("membership_digest") != expected_data_summary["validation_membership_sha256"]
+            or export_manifest.get("splits", {}).get("s0", {}).get("membership_digest") != expected_data_summary["s0_membership_sha256"]
+            or query_membership != expected_data_summary["fit_membership_sha256"]
+        ):
+            raise GateClosed("NO_GO_ASSET_ABI", "data stage manifest/query binding differs")
         if (
             final.get("status")
             != ("SEALED_PRE_ORACLE" if expected_all_pass else "INCOMPLETE_PRE_ORACLE")
@@ -1123,7 +1400,11 @@ def run_real_smoke(
             name: stage["artifacts"]["runtime.json"]
             for name, stage in verified_stages.items()
         }
+        expected_runtime_keys = {"schema", "stage", "config_sha256", "path_free_config_sha256", "invocation_wall_seconds", "peak_rss_bytes", "actor_count", "actor_setup_wall_seconds", "actor_setup_peak_rss_bytes", "stage_runtime_artifacts"}
         if (
+            not isinstance(runtime, Mapping)
+            or set(runtime) != expected_runtime_keys
+            or
             runtime.get("schema") != "policy-learnware.ope.real-smoke-runtime.v1"
             or runtime.get("stage") != "run"
             or runtime.get("config_sha256") != config_sha256
@@ -1137,26 +1418,38 @@ def run_real_smoke(
             != runtime.get("actor_setup_peak_rss_bytes")
         ):
             raise GateClosed("NO_GO_ASSET_ABI", "existing runtime identity differs")
+        _validate_runtime_numbers(runtime, ("invocation_wall_seconds", "peak_rss_bytes", "actor_setup_wall_seconds", "actor_setup_peak_rss_bytes"))
+        expected_actor_evidence = {}
         for candidate_id in candidate_ids:
             record = actors_config["candidates"][candidate_id]
-            authority = ActorAuthority.from_json(
-                record["authority_path"],
-                expected_sha256=record["authority_sha256"],
-                census_path=config["dataset"]["p0_census_path"],
-                expected_census_sha256=config["dataset"]["p0_census_sha256"],
-                registry_path=actors_config["deployment_private_registry_path"],
-                expected_registry_sha256=actors_config[
-                    "deployment_private_registry_sha256"
-                ],
-                context_id=protocol["context_id"],
-                candidate_id=candidate_id,
-            )
-            evidence = final.get("actor_evidence", {}).get(candidate_id, {})
-            if (
-                evidence.get("authority_sha256") != authority.authority_sha256
-                or evidence.get("bundle_digest") != authority.bundle_digest
-            ):
-                raise GateClosed("NO_GO_ACTOR_AUTHORITY", "existing actor evidence differs")
+            authority = verified_authorities[candidate_id]
+            actor = FrozenFPOActor(authority, bundle_dir=record["bundle_dir"], fpo_checkout=actors_config["fpo_checkout"], policy_repo_checkout=actors_config["policy_repo_checkout"])
+            expected_actor_evidence[candidate_id] = {
+                "authority_sha256": authority.authority_sha256,
+                "bundle_digest": authority.bundle_digest,
+                "semantics": actor.semantics.value,
+                "initialization_parity_status": actor.parity["status"],
+                "same_key_replay_status": actor.parity["same_key_replay"]["status"],
+                "different_key_sensitivity_status": actor.parity["different_key_sensitivity"]["status"],
+                "final_read_only_verification": dict(actor.verify_unchanged()),
+            }
+        expected_final = {
+            "schema": REAL_SMOKE_RUN_SCHEMA,
+            "status": "SEALED_PRE_ORACLE" if expected_all_pass else "INCOMPLETE_PRE_ORACLE",
+            "metrics_status": "WAITING_ORACLE" if expected_all_pass else "NOT_READY",
+            "development_only": True, "oracle_accessed": False, "environment_accessed": False,
+            "config_sha256": config_sha256, "path_free_config_sha256": normalized_config_sha256,
+            "implementation": implementation, "context_id": protocol["context_id"], "task_id": protocol["task_id"],
+            "seed": protocol["seed"], "gamma": protocol["gamma"], "horizon": protocol["horizon"],
+            "candidate_ids": candidate_ids, "actor_evidence": expected_actor_evidence,
+            "shared_setup": {"actor_count": runtime["actor_count"], "actor_setup_wall_seconds": runtime["actor_setup_wall_seconds"], "actor_setup_peak_rss_bytes": runtime["actor_setup_peak_rss_bytes"], "runtime_artifact": "runtime.json"},
+            "protocol_correction": normalized_config["protocol_correction"], "stages": stage_references,
+            "data": expected_data_summary, "ranking_seals": expected_seal_references, "rankings": expected_rankings,
+            "scientific_status": {"FH_KMIFQE_G099_H1000": "NO_GO_EXISTING_LOG_DENSITY_AND_TARGET_POLICY_SEMANTICS", "ETM_MBOPE_G099_H1000": "NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT", "discounted_value_join": "WAITING_ORACLE", "exact_density_panel": "INCOMPLETE_REQUIRED_DENSITY_PANEL"},
+            "runtime": {"path": "runtime.json", "sha256": sha256_file(runtime_path)},
+        }
+        if final != expected_final:
+            raise GateClosed("NO_GO_ASSET_ABI", "existing run payload differs")
         return final
 
     invocation_started = perf_counter()
@@ -1364,18 +1657,7 @@ def run_real_smoke(
     actors: dict[str, FrozenFPOActor] = {}
     for candidate_id in candidate_ids:
         record = actors_config["candidates"][candidate_id]
-        authority = ActorAuthority.from_json(
-            record["authority_path"],
-            expected_sha256=record["authority_sha256"],
-            census_path=config["dataset"]["p0_census_path"],
-            expected_census_sha256=config["dataset"]["p0_census_sha256"],
-            registry_path=actors_config["deployment_private_registry_path"],
-            expected_registry_sha256=actors_config[
-                "deployment_private_registry_sha256"
-            ],
-            context_id=protocol["context_id"],
-            candidate_id=candidate_id,
-        )
+        authority = verified_authorities[candidate_id]
         if authority.task_id != protocol["task_id"]:
             raise GateClosed("NO_GO_ACTOR_AUTHORITY", "actor task differs")
         actors[candidate_id] = FrozenFPOActor(
@@ -1603,15 +1885,17 @@ def run_real_smoke(
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise GateClosed("NO_GO_ASSET_ABI", "resume runtime is unreadable") from exc
         if (
-            runtime.get("schema") != proposed_runtime["schema"]
+            not isinstance(runtime, Mapping)
+            or set(runtime) != set(proposed_runtime)
+            or runtime.get("schema") != proposed_runtime["schema"]
             or runtime.get("stage") != "run"
             or runtime.get("config_sha256") != config_sha256
             or runtime.get("path_free_config_sha256") != normalized_config_sha256
             or runtime.get("actor_count") != len(actors)
             or runtime.get("stage_runtime_artifacts") != stage_runtime_artifacts
-            or not isinstance(runtime.get("actor_setup_wall_seconds"), (int, float))
         ):
             raise GateClosed("NO_GO_ASSET_ABI", "resume runtime identity differs")
+        _validate_runtime_numbers(runtime, ("invocation_wall_seconds", "peak_rss_bytes", "actor_setup_wall_seconds", "actor_setup_peak_rss_bytes"))
     else:
         runtime = proposed_runtime
         _write_canonical_json(runtime_path, runtime)

@@ -833,6 +833,7 @@ def test_actor_authority_and_live_assets_fail_closed(
         **{
             **common,
             "registry_path": relocated_registry,
+            "relocated_registry_source_path": fixture.registry,
         },
     )
     assert relocated.candidate_id == fixture.candidate_id
@@ -844,7 +845,7 @@ def test_actor_authority_and_live_assets_fail_closed(
     )
     ambiguous_census_path = tmp_path / "ambiguous-p0.json"
     ambiguous_census_path.write_bytes(_canonical_bytes(ambiguous_census))
-    with pytest.raises(DataValidationError, match="uniquely bind"):
+    with pytest.raises(DataValidationError, match="deployment registry"):
         ActorAuthority.from_json(
             fixture.authority_path,
             expected_sha256=fixture.authority_sha,
@@ -853,6 +854,7 @@ def test_actor_authority_and_live_assets_fail_closed(
                 "census_path": ambiguous_census_path,
                 "expected_census_sha256": sha256_file(ambiguous_census_path),
                 "registry_path": relocated_registry,
+                "relocated_registry_source_path": tmp_path / "wrong-scope.json",
             },
         )
 
