@@ -149,7 +149,6 @@ def test_toy_direct_api_resolves_relative_roots_and_preserves_no_clobber(
 ):
     relative = Path("ope/toy-existing")
     cases = [
-        (tmp_path / "sibling-checkout", None, None),
         (tmp_path / "environment", tmp_path / "environment", None),
         (tmp_path / "explicit", tmp_path / "ignored-env", tmp_path / "explicit"),
     ]
@@ -276,9 +275,8 @@ def test_artifact_root_resolution_order_and_safe_source_default(
         with pytest.raises(ValueError, match="relative artifact path requires"):
             cli_module._resolve_artifact_path("ope/default.json")
     else:
-        assert cli_module._resolve_artifact_path("ope/default.json") == (
-            source_root.parent / "artifacts" / "ope" / "default.json"
-        ).resolve()
+        with pytest.raises(ValueError, match="published relocation manifest"):
+            cli_module._resolve_artifact_path("ope/default.json")
 
     environment_root = tmp_path / "environment"
     explicit_root = tmp_path / "explicit"
@@ -303,10 +301,33 @@ def test_artifact_root_resolution_order_and_safe_source_default(
     symlink_target = tmp_path / "symlink-target"
     symlink_target.mkdir()
     (explicit_root / "escape").symlink_to(symlink_target, target_is_directory=True)
-    with pytest.raises(ValueError, match="escapes artifacts root"):
+    with pytest.raises(ValueError, match="symlink component"):
         cli_module._resolve_artifact_path(
             "escape/outside.json", artifacts_root=explicit_root
         )
+
+
+def test_artifact_resolver_rejects_symlink_roots_empty_env_and_git_env_spoof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink component"):
+        cli_module._resolve_artifact_path("x", artifacts_root=alias)
+    broken = tmp_path / "broken"
+    broken.symlink_to(tmp_path / "missing")
+    with pytest.raises(ValueError, match="symlink component"):
+        cli_module._resolve_artifact_path(broken / "x")
+    monkeypatch.setenv(cli_module.ARTIFACTS_ROOT_ENV, "  ")
+    with pytest.raises(ValueError, match="must not be empty"):
+        cli_module._resolve_artifact_path("x")
+    monkeypatch.setenv("GIT_DIR", str(Path.cwd() / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
+    monkeypatch.setenv("git_dir", str(tmp_path / "lowercase-spoof"))
+    monkeypatch.setenv("PATH", str(tmp_path / "fake-bin"))
+    assert cli_module._verified_source_checkout() is None
 
 
 def test_installed_layout_requires_root_and_rejects_foreign_git_writes(
