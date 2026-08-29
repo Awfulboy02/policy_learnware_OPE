@@ -294,8 +294,10 @@ def test_census_cli_missing_dataset_emits_stable_reproduction_metadata(
     assert required_identity <= identity_keys
     if cli_module._verified_source_checkout() is not None:
         assert identity_keys == required_identity
-    else:
-        assert {"package_name", "package_version"} <= identity_keys
+        elif report["implementation"]["worktree_status"] == "UNVERIFIED_GIT_SOURCE":
+            assert identity_keys == required_identity
+        else:
+            assert {"package_name", "package_version"} <= identity_keys
         assert report["implementation"]["worktree_status"] in {
             "INSTALLED_IMMUTABLE_CONTENT",
             "UNVERIFIED_PACKAGE_LAYOUT",
