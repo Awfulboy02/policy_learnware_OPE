@@ -835,6 +835,33 @@ def _resolve_real_smoke_paths(
     return resolved
 
 
+def _attach_adjacent_relocation_sidecar(
+    config: dict[str, Any], config_path: Path
+) -> None:
+    if "relocation_sidecar_path" in config["actors"]:
+        return
+    adjacent = config_path.with_name(f"{config_path.stem}.relocation.json")
+    alternatives = sorted(config_path.parent.glob(f"{config_path.stem}*.relocation.json"))
+    relocated_registry = (
+        not Path(config["actors"]["deployment_private_registry_path"]).is_absolute()
+        and "/ope/configs/reconstructed/" in config_path.as_posix()
+    )
+    if not alternatives:
+        if relocated_registry:
+            raise GateClosed(
+                "NO_GO_REAL_SMOKE_CONFIG",
+                "relocated registry requires its uniquely named adjacent sidecar",
+            )
+        return
+    if alternatives != [adjacent] or adjacent.is_symlink() or not adjacent.is_file():
+        raise GateClosed(
+            "NO_GO_REAL_SMOKE_CONFIG",
+            "adjacent relocation sidecar is ambiguous or unsafe",
+        )
+    config["actors"]["relocation_sidecar_path"] = str(adjacent)
+    config["actors"]["relocation_sidecar_sha256"] = sha256_file(adjacent)
+
+
 def _relocated_registry_source(
     config: Mapping[str, Any], *, artifacts_root: str | Path | None
 ) -> str | None:
@@ -1141,14 +1168,7 @@ def run_real_smoke(
     config, config_sha256 = _read_real_smoke_config(
         config_path, expected_config_sha256
     )
-    if "relocation_sidecar_path" not in config["actors"]:
-        adjacent = config_path.with_name(f"{config_path.stem}.relocation.json")
-        alternatives = list(config_path.parent.glob(f"{config_path.stem}*.relocation.json"))
-        if alternatives:
-            if alternatives != [adjacent] or adjacent.is_symlink() or not adjacent.is_file():
-                raise GateClosed("NO_GO_REAL_SMOKE_CONFIG", "adjacent relocation sidecar is ambiguous or unsafe")
-            config["actors"]["relocation_sidecar_path"] = str(adjacent)
-            config["actors"]["relocation_sidecar_sha256"] = sha256_file(adjacent)
+    _attach_adjacent_relocation_sidecar(config, config_path)
     config["_config_path"] = str(config_path)
     config["actors"]["deployment_private_registry_path_logical"] = config["actors"][
         "deployment_private_registry_path"

@@ -442,7 +442,7 @@ def test_artifact_resolver_rejects_symlink_roots_empty_env_and_git_env_spoof(
 
 
 def test_frozen_v2_sidecar_uniquely_binds_relocated_registry(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     root = Path("/Users/jamesmac/Desktop/RL Learnware/artifacts")
     config_path = root / "ope/configs/reconstructed/relocation-audit-b510bc8-v2/CheetahRun.json"
@@ -458,6 +458,30 @@ def test_frozen_v2_sidecar_uniquely_binds_relocated_registry(
     monkeypatch.setattr(cli_module, "_implementation_identity", lambda: {"commit": "b510bc891b3f939931ace56b9278b38909b322f7", "tree": "ca52762e2f20487dfbc9727bcb49fda318ad46bd", "worktree_status": "CLEAN"})
     assert cli_module._relocated_registry_source(resolved, artifacts_root=root).endswith("/v03-main-20260827-r0/source-market/deployment_private_registry.json")
     assert digest == sha256_file(config_path)
+
+    copied_config = tmp_path / "ope/configs/reconstructed/audit/CheetahRun.json"
+    copied_config.parent.mkdir(parents=True)
+    copied_config.write_bytes(config_path.read_bytes())
+    missing, _ = cli_module._read_real_smoke_config(copied_config, sha256_file(copied_config))
+    with pytest.raises(GateClosed, match="requires its uniquely named"):
+        cli_module._attach_adjacent_relocation_sidecar(missing, copied_config)
+    wrong_name = copied_config.parent / "CheetahRun.wrong.relocation.json"
+    wrong_name.write_bytes(sidecar_path.read_bytes())
+    wrong, _ = cli_module._read_real_smoke_config(copied_config, sha256_file(copied_config))
+    with pytest.raises(GateClosed, match="ambiguous"):
+        cli_module._attach_adjacent_relocation_sidecar(wrong, copied_config)
+    wrong_name.unlink()
+    copied_sidecar = copied_config.parent / "CheetahRun.relocation.json"
+    bad_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    bad_sidecar["reconstructed_config"]["sha256"] = "0" * 64
+    copied_sidecar.write_bytes(cli_module._canonical_bytes(bad_sidecar))
+    reverse, _ = cli_module._read_real_smoke_config(copied_config, sha256_file(copied_config))
+    cli_module._attach_adjacent_relocation_sidecar(reverse, copied_config)
+    reverse["_config_path"] = str(copied_config)
+    reverse["actors"]["deployment_private_registry_path_logical"] = reverse["actors"]["deployment_private_registry_path"]
+    reverse = cli_module._resolve_real_smoke_paths(reverse, artifacts_root=root)
+    with pytest.raises(GateClosed, match="config digest differs"):
+        cli_module._relocated_registry_source(reverse, artifacts_root=root)
 
 
 def test_relative_cli_output_requires_root_in_installed_layout(
