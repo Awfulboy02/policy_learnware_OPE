@@ -892,6 +892,21 @@ def test_actor_authority_and_live_assets_fail_closed(
             },
         )
 
+    extra_field_census = json.loads(fixture.census.read_text(encoding="utf-8"))
+    extra_field_census["input_authority"][str(fixture.registry)]["oracle"] = "forbidden"
+    extra_field_path = tmp_path / "extra-field-p0.json"
+    extra_field_path.write_bytes(_canonical_bytes(extra_field_census))
+    with pytest.raises(DataValidationError, match="deployment registry authority differs"):
+        ActorAuthority.from_json(
+            fixture.authority_path,
+            expected_sha256=fixture.authority_sha,
+            **{
+                **common,
+                "census_path": extra_field_path,
+                "expected_census_sha256": sha256_file(extra_field_path),
+            },
+        )
+
     for name, change, message in (
         ("truthy", {"validated": True}, "fields differ"),
         ("oracle", {"oracle_path": "/secret/oracle"}, "environment/oracle"),

@@ -917,6 +917,24 @@ def test_real_smoke_seals_three_methods_with_crn_and_resumes_without_reexecution
     with pytest.raises(GateClosed, match="inventory differs"):
         run_real_smoke(first_config, tmp_path / "run-a", expected_config_sha256=sha256_file(first_config), resume=True)
     extra.unlink()
+    extra_dir = tmp_path / "run-a" / ".raw.partial-forged"
+    extra_dir.mkdir()
+    with pytest.raises(GateClosed, match="root inventory differs"):
+        run_real_smoke(first_config, tmp_path / "run-a", expected_config_sha256=sha256_file(first_config), resume=True)
+    extra_dir.rmdir()
+    broken_link = tmp_path / "run-a" / "raw" / "broken"
+    broken_link.symlink_to(tmp_path / "missing")
+    with pytest.raises(GateClosed, match="unsafe entry"):
+        run_real_smoke(first_config, tmp_path / "run-a", expected_config_sha256=sha256_file(first_config), resume=True)
+    broken_link.unlink()
+    raw_stage_path = tmp_path / "run-a" / "raw" / "stage.json"
+    raw_stage_bytes = raw_stage_path.read_bytes()
+    raw_stage_extra = json.loads(raw_stage_bytes)
+    raw_stage_extra["oracle"] = True
+    raw_stage_path.write_bytes(cli_module._canonical_bytes(raw_stage_extra))
+    with pytest.raises(GateClosed, match="stage fields differ"):
+        run_real_smoke(first_config, tmp_path / "run-a", expected_config_sha256=sha256_file(first_config), resume=True)
+    raw_stage_path.write_bytes(raw_stage_bytes)
     tampered_final = json.loads(original_run_bytes)
     tampered_final["oracle_accessed"] = True
     tampered_final["extra"] = "oracle"
