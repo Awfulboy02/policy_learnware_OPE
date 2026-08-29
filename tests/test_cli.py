@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+import shutil
 
 import pytest
 
+import policy_learnware_ope.cli as cli_module
 from policy_learnware_ope.adapters import RAW_QUERY_SCHEMA
 from policy_learnware_ope.benchmark import load_ranking_seal
 from policy_learnware_ope.cli import _raw_membership_digest, _toy_batch, main, run_toy
@@ -109,7 +111,17 @@ def test_raw_membership_binds_reward_free_physical_rows() -> None:
 
 def test_cli_smoke_prints_machine_readable_summary(tmp_path: Path, capsys):
     output = tmp_path / "cli-toy"
-    assert main(["toy", "--output", str(output), "--seed", "19"]) == 0
+    assert main(
+        [
+            "toy",
+            "--artifacts-root",
+            str(tmp_path),
+            "--output",
+            "cli-toy",
+            "--seed",
+            "19",
+        ]
+    ) == 0
     printed = json.loads(capsys.readouterr().out)
     assert printed["status"] == "TOY_MVP_PASS"
     assert set(printed["methods"]) == EXPECTED_METHODS
@@ -131,15 +143,53 @@ def test_toy_runner_refuses_nonempty_output_without_partial_overwrite(tmp_path: 
     assert after == before
 
 
+def test_toy_direct_api_resolves_relative_roots_and_preserves_no_clobber(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    relative = Path("ope/toy-existing")
+    cases = [
+        (tmp_path / "sibling-checkout", None, None),
+        (tmp_path / "environment", tmp_path / "environment", None),
+        (tmp_path / "explicit", tmp_path / "ignored-env", tmp_path / "explicit"),
+    ]
+    for checkout, environment_root, explicit_root in cases:
+        if environment_root is None:
+            monkeypatch.delenv("RL_LEARNWARE_ARTIFACTS_ROOT", raising=False)
+            monkeypatch.setattr(
+                cli_module,
+                "_verified_source_checkout",
+                lambda checkout=checkout: checkout,
+            )
+            expected = checkout.parent / "artifacts" / relative
+        else:
+            monkeypatch.setenv("RL_LEARNWARE_ARTIFACTS_ROOT", str(environment_root))
+            expected_root = explicit_root or environment_root
+            expected = expected_root / relative
+        expected.mkdir(parents=True)
+        marker = expected / "keep.txt"
+        marker.write_text("do-not-overwrite\n", encoding="utf-8")
+        with pytest.raises(FileExistsError, match="refusing partial overwrite"):
+            run_toy(
+                relative,
+                seed=3,
+                implementation_commit="c" * 40,
+                artifacts_root=explicit_root,
+            )
+        assert marker.read_text(encoding="utf-8") == "do-not-overwrite\n"
+
+
 def test_real_preflight_is_stable_and_all_production_gates_are_no_go(
     tmp_path: Path,
     capsys,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     first = tmp_path / "preflight-a.json"
     second = tmp_path / "preflight-b.json"
-    assert main(["real-preflight", "--output", str(first)]) == 2
+    monkeypatch.setenv("RL_LEARNWARE_ARTIFACTS_ROOT", str(tmp_path))
+    assert main(["real-preflight", "--output", first.name]) == 2
     capsys.readouterr()
-    assert main(["real-preflight", "--output", str(second)]) == 2
+    assert main(["real-preflight", "--output", second.name]) == 2
     capsys.readouterr()
 
     assert first.read_bytes() == second.read_bytes()
@@ -165,12 +215,14 @@ def test_census_cli_missing_dataset_emits_stable_reproduction_metadata(
     assert main(
         [
             "census",
+            "--artifacts-root",
+            str(tmp_path),
             "--dataset",
-            str(missing),
+            missing.name,
             "--horizon",
             "1000",
             "--output",
-            str(output),
+            output.name,
         ]
     ) == 2
     capsys.readouterr()
@@ -179,12 +231,18 @@ def test_census_cli_missing_dataset_emits_stable_reproduction_metadata(
     assert report["seed"] is None
     assert report["config"]["asset_mode"] == "READ_ONLY"
     assert len(report["config_sha256"]) == 64
-    assert set(report["implementation"]) == {"commit", "tree", "worktree_status"}
+    identity_keys = set(report["implementation"])
+    required_identity = {"commit", "tree", "worktree_status"}
+    assert required_identity <= identity_keys
+    if cli_module._verified_source_checkout() is not None:
+        assert identity_keys == required_identity
+    else:
+        assert {"package_name", "package_version"} <= identity_keys
     assert report["provenance"]["input_paths_recorded"] is False
     assert str(tmp_path) not in output.read_text(encoding="utf-8")
 
 
-def test_cli_outputs_are_no_clobber_and_never_enter_another_git_repo(
+def test_cli_outputs_are_no_clobber_and_never_enter_a_git_repo(
     tmp_path: Path,
 ):
     existing = tmp_path / "existing.json"
@@ -196,6 +254,90 @@ def test_cli_outputs_are_no_clobber_and_never_enter_another_git_repo(
     foreign_repo = tmp_path / "frozen-old-repo"
     (foreign_repo / ".git").mkdir(parents=True)
     forbidden = foreign_repo / "artifacts" / "toy"
-    with pytest.raises(PermissionError, match="different Git repository"):
+    with pytest.raises(PermissionError, match="refusing to write into a Git repository"):
         run_toy(forbidden, seed=1, implementation_commit="f" * 40)
     assert not forbidden.exists()
+
+    source_root = cli_module._verified_source_checkout()
+    if source_root is not None:
+        with pytest.raises(
+            PermissionError, match="refusing to write into a Git repository"
+        ):
+            cli_module._guard_output_location(source_root / "artifacts" / "forbidden")
+
+
+def test_artifact_root_resolution_order_and_safe_source_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source_root = cli_module._verified_source_checkout()
+    monkeypatch.delenv("RL_LEARNWARE_ARTIFACTS_ROOT", raising=False)
+    if source_root is None:
+        with pytest.raises(ValueError, match="relative artifact path requires"):
+            cli_module._resolve_artifact_path("ope/default.json")
+    else:
+        assert cli_module._resolve_artifact_path("ope/default.json") == (
+            source_root.parent / "artifacts" / "ope" / "default.json"
+        ).resolve()
+
+    environment_root = tmp_path / "environment"
+    explicit_root = tmp_path / "explicit"
+    monkeypatch.setenv("RL_LEARNWARE_ARTIFACTS_ROOT", str(environment_root))
+    assert cli_module._resolve_artifact_path("ope/env.json") == (
+        environment_root / "ope" / "env.json"
+    ).resolve()
+    assert cli_module._resolve_artifact_path(
+        "ope/explicit.json", artifacts_root=explicit_root
+    ) == (explicit_root / "ope" / "explicit.json").resolve()
+
+    absolute = tmp_path / "absolute.json"
+    assert cli_module._resolve_artifact_path(
+        absolute, artifacts_root=explicit_root
+    ) == absolute.resolve()
+
+    with pytest.raises(ValueError, match="escapes artifacts root"):
+        cli_module._resolve_artifact_path(
+            "../outside.json", artifacts_root=explicit_root
+        )
+    explicit_root.mkdir()
+    symlink_target = tmp_path / "symlink-target"
+    symlink_target.mkdir()
+    (explicit_root / "escape").symlink_to(symlink_target, target_is_directory=True)
+    with pytest.raises(ValueError, match="escapes artifacts root"):
+        cli_module._resolve_artifact_path(
+            "escape/outside.json", artifacts_root=explicit_root
+        )
+
+
+def test_installed_layout_requires_root_and_rejects_foreign_git_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    foreign = tmp_path / "foreign-consumer"
+    (foreign / ".git").mkdir(parents=True)
+    installed_package = foreign / "site" / "policy_learnware_ope"
+    shutil.copytree(
+        Path(cli_module.__file__).resolve().parent,
+        installed_package,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    monkeypatch.setattr(cli_module, "__file__", str(installed_package / "cli.py"))
+    monkeypatch.setattr(cli_module, "distribution_version", lambda _name: "0.4.0b0")
+    monkeypatch.delenv("RL_LEARNWARE_ARTIFACTS_ROOT", raising=False)
+
+    assert cli_module._verified_source_checkout() is None
+    with pytest.raises(ValueError, match="relative artifact path requires"):
+        cli_module._resolve_artifact_path("ope/toy")
+
+    identity = cli_module._implementation_identity()
+    assert identity["commit"].startswith("PACKAGE_CONTENT_SHA256:")
+    assert identity["worktree_status"] == "INSTALLED_IMMUTABLE_CONTENT"
+    with pytest.raises(PermissionError, match="refusing to write into a Git repository"):
+        cli_module._guard_output_location(foreign / "artifacts" / "toy")
+
+    external_root = tmp_path / "artifacts"
+    external = cli_module._resolve_artifact_path(
+        "ope/toy", artifacts_root=external_root
+    )
+    assert external == (external_root / "ope" / "toy").resolve()
+    assert cli_module._guard_output_location(external) == external

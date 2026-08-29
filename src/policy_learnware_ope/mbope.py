@@ -44,10 +44,6 @@ AR_MBOPE_ID = "AR_MBOPE_G099_H1000"
 ETM_MBOPE_ID = "ETM_MBOPE_G099_H1000"
 
 
-def _value_convention(gamma: float, horizon: int) -> str:
-    return finite_horizon_value_convention(gamma, horizon)
-
-
 def _matrix(value: Any, name: str) -> np.ndarray:
     array = np.asarray(value, dtype=float)
     if array.ndim == 1:
@@ -952,7 +948,9 @@ class _BaseMBOPE:
             "native_timestep_provenance": self._timestep_provenance,
             "physical_membership_sha256": self._physical_membership_sha256,
             "source_digest": self._source_digest,
-            "value_convention": _value_convention(self.gamma, self.horizon),
+            "value_convention": finite_horizon_value_convention(
+                self.gamma, self.horizon
+            ),
             "scientific_role": self.identity["scientific_role"],
             "upstream_parity_claim": "NONE",
         }

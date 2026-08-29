@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from hashlib import sha256
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 import json
+import os
 from pathlib import Path
 import subprocess
 from time import perf_counter
+import tomllib
 from typing import Any, Sequence
 
 import numpy as np
@@ -83,18 +86,125 @@ def _containing_git_root(path: Path) -> Path | None:
     for candidate in (current, *current.parents):
         if (candidate / ".git").exists():
             return candidate.resolve()
+        bare_markers = (
+            (candidate / "HEAD").is_file()
+            and (candidate / "objects").is_dir()
+            and (candidate / "refs").is_dir()
+            and (candidate / "config").is_file()
+        )
+        if bare_markers:
+            try:
+                bare = subprocess.run(
+                    [
+                        "git",
+                        f"--git-dir={candidate}",
+                        "config",
+                        "--bool",
+                        "--get",
+                        "core.bare",
+                    ],
+                    check=False,
+                    text=True,
+                    capture_output=True,
+                )
+            except OSError:
+                return candidate.resolve()
+            if bare.returncode != 0 or bare.stdout.strip() == "true":
+                return candidate.resolve()
     return None
 
 
+def _verified_source_checkout() -> Path | None:
+    """Return this package's Git root only for the canonical source layout."""
+
+    current_file = Path(__file__).resolve()
+    candidate = current_file.parents[2]
+    expected_cli = candidate / "src" / "policy_learnware_ope" / "cli.py"
+    pyproject = candidate / "pyproject.toml"
+    try:
+        metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        project_name = metadata["project"]["name"]
+        same_cli = expected_cli.samefile(current_file)
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        return None
+    if not (candidate / ".git").exists() or project_name != "policy-learnware-ope":
+        return None
+    return candidate if same_cli else None
+
+
+def _installed_package_identity() -> dict[str, Any]:
+    package_root = Path(__file__).resolve().parent
+    try:
+        package_version = distribution_version("policy-learnware-ope")
+        status = "INSTALLED_IMMUTABLE_CONTENT"
+    except PackageNotFoundError:
+        package_version = "UNAVAILABLE"
+        status = "UNVERIFIED_PACKAGE_LAYOUT"
+    files = sorted(path for path in package_root.rglob("*.py") if path.is_file())
+    manifest = {
+        "schema": "policy-learnware.installed-python-tree.v1",
+        "distribution": "policy-learnware-ope",
+        "version": package_version,
+        "files": [
+            {
+                "path": path.relative_to(package_root).as_posix(),
+                "sha256": sha256(path.read_bytes()).hexdigest(),
+            }
+            for path in files
+        ],
+    }
+    tree_digest = _payload_digest(manifest)
+    return {
+        "commit": f"PACKAGE_CONTENT_SHA256:{tree_digest}",
+        "tree": tree_digest,
+        "worktree_status": status,
+        "package_name": "policy-learnware-ope",
+        "package_version": package_version,
+    }
+
+
+def _resolve_artifact_path(
+    path: str | Path,
+    *,
+    artifacts_root: str | Path | None = None,
+) -> Path:
+    """Resolve one CLI artifact path without inheriting a foreign checkout."""
+
+    requested = Path(path).expanduser()
+    if requested.is_absolute():
+        return requested.resolve()
+    root_value = artifacts_root
+    if root_value is None:
+        root_value = os.environ.get("RL_LEARNWARE_ARTIFACTS_ROOT")
+    if root_value is None:
+        checkout = _verified_source_checkout()
+        if checkout is None:
+            raise ValueError(
+                "relative artifact path requires --artifacts-root or "
+                "RL_LEARNWARE_ARTIFACTS_ROOT outside a verified source checkout"
+            )
+        root = checkout.parent / "artifacts"
+    else:
+        root = Path(root_value).expanduser()
+        if not root.is_absolute():
+            raise ValueError("artifacts root must be an absolute path")
+    root = root.resolve()
+    resolved = (root / requested).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError("relative artifact path escapes artifacts root") from error
+    return resolved
+
+
 def _guard_output_location(path: str | Path) -> Path:
-    """Reject writes into any Git repository other than this companion."""
+    """Reject experiment writes into any Git repository."""
 
     destination = Path(path).resolve()
     containing_repo = _containing_git_root(destination)
-    companion_repo = Path(__file__).resolve().parents[2]
-    if containing_repo is not None and containing_repo != companion_repo:
+    if containing_repo is not None:
         raise PermissionError(
-            f"refusing to write into a different Git repository: {containing_repo}"
+            f"refusing to write into a Git repository: {containing_repo}"
         )
     return destination
 
@@ -106,7 +216,9 @@ def _implementation_identity(commit_override: str | None = None) -> dict[str, An
             "tree": "CALLER_SUPPLIED",
             "worktree_status": "CALLER_SUPPLIED",
         }
-    repository = Path(__file__).resolve().parents[2]
+    repository = _verified_source_checkout()
+    if repository is None:
+        return _installed_package_identity()
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -400,8 +512,11 @@ def run_toy(
     *,
     seed: int = 7,
     implementation_commit: str | None = None,
+    artifacts_root: str | Path | None = None,
 ) -> dict[str, Any]:
-    destination = _guard_output_location(output)
+    destination = _guard_output_location(
+        _resolve_artifact_path(output, artifacts_root=artifacts_root)
+    )
     if destination.exists() and not destination.is_dir():
         raise FileExistsError(f"toy output exists and is not a directory: {destination}")
     if destination.is_dir() and any(destination.iterdir()):
@@ -822,9 +937,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="policy-learnware-ope")
     commands = parser.add_subparsers(dest="command", required=True)
     toy = commands.add_parser("toy", help="run all methods on a synthetic finite-horizon fixture")
+    toy.add_argument("--artifacts-root", type=Path)
     toy.add_argument("--output", required=True, type=Path)
     toy.add_argument("--seed", type=int, default=7)
     census = commands.add_parser("census", help="perform a read-only real-asset adequacy census")
+    census.add_argument("--artifacts-root", type=Path)
     census.add_argument("--dataset", required=True, type=Path)
     census.add_argument("--oracle", type=Path)
     census.add_argument("--density-manifest", type=Path)
@@ -839,6 +956,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "real-preflight",
         help="emit the stable fail-closed production readiness decision",
     )
+    preflight.add_argument("--artifacts-root", type=Path)
     preflight.add_argument("--output", required=True, type=Path)
     return parser
 
@@ -846,8 +964,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "toy":
-        result = run_toy(args.output, seed=args.seed)
-        run_path = Path(args.output).resolve() / "run.json"
+        output = _resolve_artifact_path(args.output, artifacts_root=args.artifacts_root)
+        result = run_toy(output, seed=args.seed)
+        run_path = output / "run.json"
         print(
             json.dumps(
                 {
@@ -867,7 +986,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result["status"] == "TOY_MVP_PASS" else 1
     if args.command == "real-preflight":
         report = build_real_preflight()
-        output_path = _guard_output_location(args.output)
+        output_path = _guard_output_location(
+            _resolve_artifact_path(args.output, artifacts_root=args.artifacts_root)
+        )
         _write_canonical_json(output_path, report)
         print(
             json.dumps(
@@ -880,11 +1001,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 2
+    dataset = _resolve_artifact_path(args.dataset, artifacts_root=args.artifacts_root)
+    oracle = (
+        _resolve_artifact_path(args.oracle, artifacts_root=args.artifacts_root)
+        if args.oracle is not None
+        else None
+    )
+    density_manifest = (
+        _resolve_artifact_path(args.density_manifest, artifacts_root=args.artifacts_root)
+        if args.density_manifest is not None
+        else None
+    )
+    actor_authority = (
+        _resolve_artifact_path(args.actor_authority, artifacts_root=args.artifacts_root)
+        if args.actor_authority is not None
+        else None
+    )
     report = census_real_assets(
-        dataset_path=args.dataset,
-        oracle_path=args.oracle,
-        density_manifest_path=args.density_manifest,
-        actor_authority_path=args.actor_authority,
+        dataset_path=dataset,
+        oracle_path=oracle,
+        density_manifest_path=density_manifest,
+        actor_authority_path=actor_authority,
         horizon=args.horizon,
         expected_dataset_digest=args.expected_dataset_digest,
         expected_oracle_digest=args.expected_oracle_digest,
@@ -899,9 +1036,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "expected_oracle_sha256": args.expected_oracle_digest,
         "expected_density_manifest_sha256": args.expected_density_manifest_digest,
         "expected_actor_authority_sha256": args.expected_actor_authority_digest,
-        "oracle_supplied": args.oracle is not None,
-        "density_manifest_supplied": args.density_manifest is not None,
-        "actor_authority_supplied": args.actor_authority is not None,
+        "oracle_supplied": oracle is not None,
+        "density_manifest_supplied": density_manifest is not None,
+        "actor_authority_supplied": actor_authority is not None,
         "asset_mode": "READ_ONLY",
     }
     report.update(
@@ -920,7 +1057,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
     )
     if args.output:
-        _write_canonical_json(_guard_output_location(args.output), report)
+        output = _resolve_artifact_path(args.output, artifacts_root=args.artifacts_root)
+        _write_canonical_json(_guard_output_location(output), report)
     print(json.dumps(report, sort_keys=True))
     return 0 if report["status"] == "PASS" else 2
 
