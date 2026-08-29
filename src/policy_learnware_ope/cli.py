@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 import json
+import os
 from pathlib import Path
 import subprocess
 from time import perf_counter
@@ -56,6 +57,7 @@ TOY_HORIZON = 5
 TOY_GAMMA = 0.99
 TOY_VALUE_CONVENTION = finite_horizon_value_convention(TOY_GAMMA, TOY_HORIZON)
 V04B_PLAN_SHA256 = "5fb35cc2ee4c27afd411f77f0c2813088b6d6ab901f8910f442ed5b231e1719e"
+ARTIFACTS_ROOT_ENV = "RL_LEARNWARE_ARTIFACTS_ROOT"
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -160,6 +162,40 @@ def _verified_source_checkout() -> Path | None:
     return candidate if same_cli else None
 
 
+def _resolve_artifact_path(
+    path: str | Path,
+    *,
+    artifacts_root: str | Path | None = None,
+) -> Path:
+    """Resolve a CLI artifact path without inheriting a foreign checkout."""
+
+    requested = Path(path).expanduser()
+    if requested.is_absolute():
+        return requested.resolve()
+    configured_root = artifacts_root
+    if configured_root is None:
+        configured_root = os.environ.get(ARTIFACTS_ROOT_ENV) or None
+    if configured_root is None:
+        checkout = _verified_source_checkout()
+        if checkout is None:
+            raise ValueError(
+                f"relative artifact path requires --artifacts-root or {ARTIFACTS_ROOT_ENV} "
+                "outside a verified source checkout"
+            )
+        root = checkout.parent / "artifacts"
+    else:
+        root = Path(configured_root).expanduser()
+        if not root.is_absolute():
+            raise ValueError("artifacts root must be an absolute path")
+    resolved_root = root.resolve()
+    resolved = (resolved_root / requested).resolve()
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError("relative artifact path escapes the selected artifacts root") from exc
+    return resolved
+
+
 def _installed_package_identity() -> dict[str, Any]:
     package_root = Path(__file__).resolve().parent
     try:
@@ -194,14 +230,13 @@ def _installed_package_identity() -> dict[str, Any]:
 
 
 def _guard_output_location(path: str | Path) -> Path:
-    """Reject writes into any Git repository other than this companion."""
+    """Reject artifact writes into any Git worktree or bare repository."""
 
     destination = Path(path).resolve()
     containing_repo = _containing_git_root(destination)
-    companion_repo = _verified_source_checkout()
-    if containing_repo is not None and containing_repo != companion_repo:
+    if containing_repo is not None:
         raise PermissionError(
-            f"refusing to write into a different Git repository: {containing_repo}"
+            f"refusing to write into a Git repository: {containing_repo}"
         )
     return destination
 
@@ -528,8 +563,11 @@ def run_toy(
     *,
     seed: int = 7,
     implementation_commit: str | None = None,
+    artifacts_root: str | Path | None = None,
 ) -> dict[str, Any]:
-    destination = _guard_output_location(output)
+    destination = _guard_output_location(
+        _resolve_artifact_path(output, artifacts_root=artifacts_root)
+    )
     if destination.exists() and not destination.is_dir():
         raise FileExistsError(f"toy output exists and is not a directory: {destination}")
     if destination.is_dir() and any(destination.iterdir()):
@@ -1077,14 +1115,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="emit the stable fail-closed production readiness decision",
     )
     preflight.add_argument("--output", required=True, type=Path)
+    for command in (toy, census, preflight):
+        command.add_argument(
+            "--artifacts-root",
+            type=Path,
+            help=f"external asset root (otherwise ${ARTIFACTS_ROOT_ENV} or safe checkout default)",
+        )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "toy":
-        result = run_toy(args.output, seed=args.seed)
-        run_path = Path(args.output).resolve() / "run.json"
+        output_path = _resolve_artifact_path(
+            args.output,
+            artifacts_root=args.artifacts_root,
+        )
+        result = run_toy(output_path, seed=args.seed)
+        run_path = output_path / "run.json"
         print(
             json.dumps(
                 {
@@ -1104,7 +1152,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result["status"] == "TOY_MVP_PASS" else 1
     if args.command == "real-preflight":
         report = build_real_preflight()
-        output_path = _guard_output_location(args.output)
+        output_path = _guard_output_location(
+            _resolve_artifact_path(
+                args.output,
+                artifacts_root=args.artifacts_root,
+            )
+        )
         _write_canonical_json(output_path, report)
         print(
             json.dumps(
@@ -1117,11 +1170,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 2
+    dataset_path = _resolve_artifact_path(
+        args.dataset,
+        artifacts_root=args.artifacts_root,
+    )
+    oracle_path = (
+        _resolve_artifact_path(args.oracle, artifacts_root=args.artifacts_root)
+        if args.oracle is not None
+        else None
+    )
+    density_manifest_path = (
+        _resolve_artifact_path(
+            args.density_manifest,
+            artifacts_root=args.artifacts_root,
+        )
+        if args.density_manifest is not None
+        else None
+    )
+    actor_authority_path = (
+        _resolve_artifact_path(
+            args.actor_authority,
+            artifacts_root=args.artifacts_root,
+        )
+        if args.actor_authority is not None
+        else None
+    )
     report = census_real_assets(
-        dataset_path=args.dataset,
-        oracle_path=args.oracle,
-        density_manifest_path=args.density_manifest,
-        actor_authority_path=args.actor_authority,
+        dataset_path=dataset_path,
+        oracle_path=oracle_path,
+        density_manifest_path=density_manifest_path,
+        actor_authority_path=actor_authority_path,
         horizon=args.horizon,
         expected_dataset_digest=args.expected_dataset_digest,
         expected_oracle_digest=args.expected_oracle_digest,
@@ -1157,7 +1235,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
     )
     if args.output:
-        _write_canonical_json(_guard_output_location(args.output), report)
+        output_path = _resolve_artifact_path(
+            args.output,
+            artifacts_root=args.artifacts_root,
+        )
+        _write_canonical_json(_guard_output_location(output_path), report)
     print(json.dumps(report, sort_keys=True))
     return 0 if report["status"] == "PASS" else 2
 

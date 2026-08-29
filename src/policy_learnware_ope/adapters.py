@@ -209,11 +209,6 @@ class ActorAuthority:
             encoding="utf-8",
         )
 
-    def digest(self) -> str:
-        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
-        return sha256(payload).hexdigest()
-
-
 class ActorProvider(Protocol):
     authorities: Mapping[str, ActorAuthority]
 

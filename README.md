@@ -1,92 +1,80 @@
 # Policy Learnware OPE v0.41b
 
-Small companion repository for method-level, finite-horizon policy-selection
-experiments. The v03 repository, policy bundles, logs, manifests, and oracle
-assets remain read-only external inputs.
+This branch is the compact source and method release for finite-horizon policy
+selection. It provides executable NumPy implementations, ranking seals,
+fail-closed production preflight, and synthetic reproduction tests. It does not
+contain the later real-smoke runner or any tracked datasets, actor bundles,
+oracles, run outputs, wheels, or release payloads.
 
-The executable synthetic MVP contains five fitted estimators:
+The original source release is commit
+`9be1d4c0b632ce2f54d0037036873cf6240da1e2`, tree
+`45fa10cd91dbb25f86853440d512b4e100303d11`.
 
-- `FH_FQE`: compact NumPy finite-horizon ridge FQE reference.
-- `FH_KMIFQE`: B20 protocol adaptation with a candidate-specific nonlinear
-  critic/target critic, local action-Hessian metrics, B20 bias/variance
-  bandwidth updates, replacement importance resampling, and in-sample TD on
-  logged adjacent actions.
-- `ETM_MBOPE`: B22 protocol adaptation with model-generated training-time
-  Langevin negatives and an analytic gradient-penalty VJP into the trainable
-  RFF energy head.
-- `DOPE_STYLE_MB_FF`: project-defined feed-forward model-based reference. DOPE
-  is inspiration for the benchmark design, not the name of an upstream
-  algorithm implemented here.
-- `AR_MBOPE`: B06-inspired project adaptation/proxy, kept independent from the
-  feed-forward model.
+## Method scope
 
-Method IDs are derived from the protocol actually executed. Thus the toy run
-emits `..._G099_H5`; only a real `gamma=.99, H=1000` run may emit
-`..._G099_H1000`.
+- `FH_FQE` is the finite-horizon ridge FQE reference.
+- `FH_KMIFQE` is a B20 protocol adaptation with a nonlinear critic, local
+  action-Hessian metric, bias/variance bandwidth update, replacement
+  resampling, and logged-adjacent-action TD. It is not official-code or
+  published-number parity.
+- `ETM_MBOPE` is an ETM-RFF protocol adaptation with training-time Langevin
+  negatives and an analytic gradient-penalty VJP. Its fixed RFF energy is not
+  the official MLP and it is not paper parity.
+- `DOPE_STYLE_MB_FF` and `AR_MBOPE` are project references/adaptations, not
+  official DOPE or B06 reproductions.
+- `RAW_ADAPTER_FIXTURE` is a sealed reward-free fixture ranking score. It is not
+  a production Raw operator, and its score is not a `J_gamma` value; value
+  MAE/RMSE are therefore not applicable.
 
-`RAW_ADAPTER_FIXTURE` tests a reward-free, digest-bound TASK_5 request and
-sealed response. It uses fixture scores and is not a Raw-Delta/RKME
-implementation. Production Raw remains `NO_GO_RAW_OPERATOR_AUTHORITY` until a
-trusted export authority and reward-free membership verifier are implemented;
-this release does not expose a production Raw execution path. Live subprocess
-execution is intentionally disabled because this companion cannot yet enforce
-the old repository and assets as read-only.
+Method IDs bind the executed gamma and horizon: the toy fixture emits
+`..._G099_H5`, never `H1000`.
+
+## External artifacts
+
+No experiment payload is tracked in Git. Paths resolve in this order:
+
+1. an absolute CLI path;
+2. a relative path under explicit `--artifacts-root`;
+3. a relative path under `RL_LEARNWARE_ARTIFACTS_ROOT`;
+4. from a verified source checkout only, `<repository-parent>/artifacts`.
+
+Relative paths may not escape the selected root. Installed or foreign layouts
+fail closed for relative paths when neither an explicit root nor the environment
+variable is supplied; configured roots must be absolute. Outputs inside any
+detected Git worktree or bare repository are rejected. Canonical OPE assets live
+under `artifacts/ope/`; the historical improvement report is external at the
+canonical logical path
+`reports/ope/v041b/Policy_Learnware_v0.41b_Improvement_Report.md`.
 
 ```bash
 python -m pip install -e '.[test]'
-policy-learnware-ope toy --output artifacts/toy --seed 7
-policy-learnware-ope real-preflight --output artifacts/real-preflight.json
-pytest
+export RL_LEARNWARE_ARTIFACTS_ROOT=/path/to/artifacts
+policy-learnware-ope toy --output ope/toy/v041b-seed7 --seed 7
+policy-learnware-ope real-preflight --output ope/preflight/v041b.json
+policy-learnware-ope census \
+  --dataset ope/datasets/example.npz \
+  --output ope/census/example.json
+PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider
 ```
 
-R0 validates both the source checkout and an untracked `0.4.1b0` wheel built
-offline with the declared `setuptools>=77` backend. Installed code never treats
-a consumer repository as this companion checkout: its implementation identity
-is the installed distribution version plus a digest of sorted package Python
-files, and outputs inside a detected foreign worktree or bare Git repository
-are rejected. A malformed `core.bare` value or unreadable bare-repository config
-produces Git `config --bool` return code 128 and also fails closed; the valid
-`core.bare=yes` form is recognized normally, and output outside Git repositories
-remains allowed.
-Source-checkout identity is read from Git only after the canonical `src/`
-layout, project name, and current `cli.py` path are verified. The R0 runtime
-freeze is commit `277c815eb44b8b10abff2c687d8b585031b3d2b3`, tree
-`b00c3a40bc65e58aed2795ca0ce150cd5033cc22`. A no-`.git` archive is used for
-isolated import/tests and as wheel build input; immutable distribution-version
-and package-content identity claims come from a fresh wheel install, not from
-ambient editable metadata.
+`TOY_MVP_PASS` and the original 94-test source-release audit mean that the
+method-level fixture and engineering gates execute. They do not establish paper
+parity or production validity.
 
-The real preflight intentionally exits nonzero and records `NO_GO` for the
-three presently missing capabilities: verified actor authority, exact
-arbitrary-action behavior density, and a per-step oracle bound to
-`J(gamma=.99,H=1000)`. Production Raw is separately `NO_GO`. It also exposes
-the method-level `NO_GO_OPS_DS_DENSE_HESSIAN_PANEL` and
-`NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT` blockers without changing synthetic
-toy estimates from `PASS`. No recollection, policy retraining, oracle rewriting,
-or old-asset mutation is performed.
+## Scientific terminal state
 
-Ranking seals are canonical, write-once payloads. Their SHA-256 is retained by
-a separate run manifest and must be supplied when loading or joining an oracle.
-The CLI summary also emits the run, seal, and oracle-manifest digests so a
-caller can retain them outside the artifact directory.
-The toy runner refuses a nonempty output directory, preventing a failed rerun
-from mixing newly overwritten inputs with an older sealed manifest.
-The oracle manifest independently binds context, candidate set, value
-convention, and its caller-held digest. Wall-clock measurements are attached
-only after the seal and are exported in `runtime.json` and post-join metrics.
+The later v0.4b development line, not this branch, ran the two preregistered
+real pre-oracle cells and froze the overall result as
+`FROZEN_SUPPORTING_STUDY_PRE_ORACLE_NO_GO`:
 
-`TOY_MVP_PASS` means the method executed a real fit/estimate path on the
-synthetic fixture. It does not mean paper-level or official-code parity, and it
-does not claim that the production real-asset gates have passed.
+- Cheetah FQE: `NO_GO_FIT_DIVERGENCE`;
+- Walker MB-FF: `NO_GO_MODEL_ROLLOUT_DIVERGENCE`;
+- KMIFQE: excluded as
+  `NO_GO_EXISTING_LOG_DENSITY_AND_TARGET_POLICY_SEMANTICS` (missing exact
+  existing-log density and incompatible stochastic-keyed target-policy
+  semantics);
+- ETM: excluded as `NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT`.
 
-The KMIFQE critic is a compact fixed-tanh-feature NumPy adaptation rather than
-the official fully trained PyTorch network. The ETM energy is a compact RFF
-adaptation rather than the official four-layer MLP. Both export their actual
-configuration and remaining drift, and neither claims published benchmark
-parity.
-
-Hashes are exact for discrete protocol identity, assets, membership, seeds,
-configuration, and sealed ranking artifacts. Floating results are checked with
-declared dtype-aware tolerances plus finiteness, mechanism invariants, and
-ranking stability; a legitimate backend-rounding difference is not treated as
-an asset or protocol mismatch.
+No oracle join was permitted. The engineering PASS and scientific NO-GO apply
+to different scopes: source/wheel/toy PASS must never be read as overturning the
+real-study terminal state.
