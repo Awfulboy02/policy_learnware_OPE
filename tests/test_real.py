@@ -824,6 +824,38 @@ def test_actor_authority_and_live_assets_fail_closed(
         "context_id": CONTEXT_ID,
         "candidate_id": fixture.candidate_id,
     }
+    relocated_registry = tmp_path / "relocated" / fixture.registry.name
+    relocated_registry.parent.mkdir()
+    relocated_registry.write_bytes(fixture.registry.read_bytes())
+    relocated = ActorAuthority.from_json(
+        fixture.authority_path,
+        expected_sha256=fixture.authority_sha,
+        **{
+            **common,
+            "registry_path": relocated_registry,
+        },
+    )
+    assert relocated.candidate_id == fixture.candidate_id
+
+    ambiguous_census = json.loads(fixture.census.read_text(encoding="utf-8"))
+    original_record = ambiguous_census["input_authority"][str(fixture.registry)]
+    ambiguous_census["input_authority"][str(tmp_path / "second-old-registry.json")] = dict(
+        original_record
+    )
+    ambiguous_census_path = tmp_path / "ambiguous-p0.json"
+    ambiguous_census_path.write_bytes(_canonical_bytes(ambiguous_census))
+    with pytest.raises(DataValidationError, match="uniquely bind"):
+        ActorAuthority.from_json(
+            fixture.authority_path,
+            expected_sha256=fixture.authority_sha,
+            **{
+                **common,
+                "census_path": ambiguous_census_path,
+                "expected_census_sha256": sha256_file(ambiguous_census_path),
+                "registry_path": relocated_registry,
+            },
+        )
+
     with pytest.raises(DataValidationError, match="authority digest mismatch"):
         ActorAuthority.from_json(
             fixture.authority_path, expected_sha256="0" * 64, **common

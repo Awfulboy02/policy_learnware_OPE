@@ -1,4 +1,4 @@
-"""Single command-line runner for synthetic acceptance and read-only census."""
+"""Single command-line runner for synthetic and oracle-blind real smoke checks."""
 
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ from .adapters import (
     RAW_SCORE_SEMANTICS,
     RawDeltaTask5Adapter,
     SealedRawOperator,
-    census_real_assets,
     execute_frozen_raw_query,
     sha256_file,
 )
@@ -77,6 +76,7 @@ V04B_PLAN_SHA256 = "5fb35cc2ee4c27afd411f77f0c2813088b6d6ab901f8910f442ed5b231e1
 REAL_SMOKE_CONFIG_SCHEMA = "policy-learnware.ope.real-smoke-config.v1"
 REAL_SMOKE_STAGE_SCHEMA = "policy-learnware.ope.real-smoke-stage.v1"
 REAL_SMOKE_RUN_SCHEMA = "policy-learnware.ope.real-smoke-run.v1"
+ARTIFACTS_ROOT_ENV = "RL_LEARNWARE_ARTIFACTS_ROOT"
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -181,6 +181,52 @@ def _verified_source_checkout() -> Path | None:
     return candidate if same_cli else None
 
 
+def _artifacts_root(explicit_root: str | Path | None = None) -> Path:
+    """Resolve the one external artifact root without trusting foreign layouts."""
+
+    configured = explicit_root
+    if configured is None:
+        configured = os.environ.get(ARTIFACTS_ROOT_ENV)
+    if configured is not None:
+        root = Path(configured).expanduser()
+        if not root.is_absolute():
+            raise GateClosed(
+                "NO_GO_ARTIFACT_ROOT",
+                f"{ARTIFACTS_ROOT_ENV} and --artifacts-root must be absolute",
+            )
+        return root.resolve()
+    repository = _verified_source_checkout()
+    if repository is None:
+        raise GateClosed(
+            "NO_GO_ARTIFACT_ROOT",
+            "installed or foreign layouts require --artifacts-root or "
+            f"{ARTIFACTS_ROOT_ENV}",
+        )
+    return (repository.parent / "artifacts").resolve()
+
+
+def _artifact_path(
+    path: str | Path,
+    *,
+    artifacts_root: str | Path | None = None,
+) -> Path:
+    """Keep absolute legacy receipts stable; root only relative artifact paths."""
+
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+    root = _artifacts_root(artifacts_root)
+    resolved = (root / candidate).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise GateClosed(
+            "NO_GO_ARTIFACT_ROOT",
+            "relative artifact path escapes the configured artifact root",
+        ) from exc
+    return resolved
+
+
 def _installed_package_identity() -> dict[str, Any]:
     package_root = Path(__file__).resolve().parent
     try:
@@ -214,15 +260,18 @@ def _installed_package_identity() -> dict[str, Any]:
     }
 
 
-def _guard_output_location(path: str | Path) -> Path:
-    """Reject writes into any Git repository other than this companion."""
+def _guard_output_location(
+    path: str | Path,
+    *,
+    artifacts_root: str | Path | None = None,
+) -> Path:
+    """Reject artifact writes into every source, foreign, or bare Git repository."""
 
-    destination = Path(path).resolve()
+    destination = _artifact_path(path, artifacts_root=artifacts_root)
     containing_repo = _containing_git_root(destination)
-    companion_repo = _verified_source_checkout()
-    if containing_repo is not None and containing_repo != companion_repo:
+    if containing_repo is not None:
         raise PermissionError(
-            f"refusing to write into a different Git repository: {containing_repo}"
+            f"refusing to write artifacts into a Git repository: {containing_repo}"
         )
     return destination
 
@@ -623,6 +672,53 @@ def _read_real_smoke_config(
     return config, expected_sha256
 
 
+def _resolve_real_smoke_paths(
+    config: Mapping[str, Any],
+    *,
+    artifacts_root: str | Path | None,
+) -> dict[str, Any]:
+    """Resolve operational paths after the immutable config bytes are verified."""
+
+    resolved = dict(config)
+    dataset = dict(config["dataset"])
+    for key in ("p0_census_path", "bank_path"):
+        dataset[key] = str(_artifact_path(dataset[key], artifacts_root=artifacts_root))
+    resolved["dataset"] = dataset
+
+    actors = dict(config["actors"])
+    for key in (
+        "fpo_checkout",
+        "policy_repo_checkout",
+        "deployment_private_registry_path",
+    ):
+        actors[key] = str(_artifact_path(actors[key], artifacts_root=artifacts_root))
+    actors["candidates"] = {
+        candidate_id: {
+            **dict(record),
+            "authority_path": str(
+                _artifact_path(record["authority_path"], artifacts_root=artifacts_root)
+            ),
+            "bundle_dir": str(
+                _artifact_path(record["bundle_dir"], artifacts_root=artifacts_root)
+            ),
+        }
+        for candidate_id, record in config["actors"]["candidates"].items()
+    }
+    resolved["actors"] = actors
+
+    raw = dict(config["raw"])
+    for key in (
+        "authority_path",
+        "repo_root",
+        "raw_view_root",
+        "asset_census_path",
+        "raw_adapter_path",
+    ):
+        raw[key] = str(_artifact_path(raw[key], artifacts_root=artifacts_root))
+    resolved["raw"] = raw
+    return resolved
+
+
 def _real_smoke_p0_identity(
     config: Mapping[str, Any]
 ) -> tuple[list[str], str, dict[str, Any]]:
@@ -807,12 +903,15 @@ def run_real_smoke(
     *,
     expected_config_sha256: str,
     resume: bool = False,
+    artifacts_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run Raw + FQE + MB-FF and stop after oracle-blind ranking seals."""
 
+    config_path = _artifact_path(config_path, artifacts_root=artifacts_root)
     config, config_sha256 = _read_real_smoke_config(
         config_path, expected_config_sha256
     )
+    config = _resolve_real_smoke_paths(config, artifacts_root=artifacts_root)
     candidate_ids, bank_sha256, frozen_membership = _real_smoke_p0_identity(config)
     protocol = config["protocol"]
     actors_config = config["actors"]
@@ -861,7 +960,7 @@ def run_real_smoke(
         "mbff": dict(config["mbff"]),
     }
     normalized_config_sha256 = _payload_digest(normalized_config)
-    destination = _guard_output_location(output)
+    destination = _guard_output_location(output, artifacts_root=artifacts_root)
     if destination.exists() and not destination.is_dir():
         raise FileExistsError(f"real-smoke output is not a directory: {destination}")
     if destination.exists() and any(destination.iterdir()) and not resume:
@@ -1659,8 +1758,9 @@ def run_toy(
     *,
     seed: int = 7,
     implementation_commit: str | None = None,
+    artifacts_root: str | Path | None = None,
 ) -> dict[str, Any]:
-    destination = _guard_output_location(output)
+    destination = _guard_output_location(output, artifacts_root=artifacts_root)
     if destination.exists() and not destination.is_dir():
         raise FileExistsError(f"toy output exists and is not a directory: {destination}")
     if destination.is_dir() and any(destination.iterdir()):
@@ -2192,22 +2292,13 @@ def _build_parser() -> argparse.ArgumentParser:
     toy = commands.add_parser("toy", help="run all methods on a synthetic finite-horizon fixture")
     toy.add_argument("--output", required=True, type=Path)
     toy.add_argument("--seed", type=int, default=7)
-    census = commands.add_parser("census", help="perform a read-only real-asset adequacy census")
-    census.add_argument("--dataset", required=True, type=Path)
-    census.add_argument("--oracle", type=Path)
-    census.add_argument("--density-manifest", type=Path)
-    census.add_argument("--actor-authority", type=Path)
-    census.add_argument("--expected-dataset-digest")
-    census.add_argument("--expected-oracle-digest")
-    census.add_argument("--expected-density-manifest-digest")
-    census.add_argument("--expected-actor-authority-digest")
-    census.add_argument("--horizon", type=int, default=1000)
-    census.add_argument("--output", type=Path)
+    toy.add_argument("--artifacts-root", type=Path)
     preflight = commands.add_parser(
         "real-preflight",
         help="emit the stable fail-closed production readiness decision",
     )
     preflight.add_argument("--output", required=True, type=Path)
+    preflight.add_argument("--artifacts-root", type=Path)
     real_smoke = commands.add_parser(
         "real-smoke",
         help="run Raw, FQE, and MB-FF through oracle-blind ranking seals",
@@ -2216,14 +2307,21 @@ def _build_parser() -> argparse.ArgumentParser:
     real_smoke.add_argument("--expected-config-sha256", required=True)
     real_smoke.add_argument("--output", required=True, type=Path)
     real_smoke.add_argument("--resume", action="store_true")
+    real_smoke.add_argument("--artifacts-root", type=Path)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "toy":
-        result = run_toy(args.output, seed=args.seed)
-        run_path = Path(args.output).resolve() / "run.json"
+        result = run_toy(
+            args.output,
+            seed=args.seed,
+            artifacts_root=args.artifacts_root,
+        )
+        run_path = _artifact_path(
+            args.output, artifacts_root=args.artifacts_root
+        ) / "run.json"
         print(
             json.dumps(
                 {
@@ -2243,7 +2341,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result["status"] == "TOY_MVP_PASS" else 1
     if args.command == "real-preflight":
         report = build_real_preflight()
-        output_path = _guard_output_location(args.output)
+        output_path = _guard_output_location(
+            args.output, artifacts_root=args.artifacts_root
+        )
         _write_canonical_json(output_path, report)
         print(
             json.dumps(
@@ -2263,6 +2363,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.output,
                 expected_config_sha256=args.expected_config_sha256,
                 resume=args.resume,
+                artifacts_root=args.artifacts_root,
             )
         except (GateClosed, DataValidationError) as exc:
             print(
@@ -2271,7 +2372,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 2
-        run_path = Path(args.output).resolve() / "run.json"
+        run_path = _artifact_path(
+            args.output, artifacts_root=args.artifacts_root
+        ) / "run.json"
         print(
             json.dumps(
                 {
@@ -2290,49 +2393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 0 if report["status"] == "SEALED_PRE_ORACLE" else 2
-    report = census_real_assets(
-        dataset_path=args.dataset,
-        oracle_path=args.oracle,
-        density_manifest_path=args.density_manifest,
-        actor_authority_path=args.actor_authority,
-        horizon=args.horizon,
-        expected_dataset_digest=args.expected_dataset_digest,
-        expected_oracle_digest=args.expected_oracle_digest,
-        expected_density_manifest_digest=args.expected_density_manifest_digest,
-        expected_actor_authority_digest=args.expected_actor_authority_digest,
-    )
-    implementation = _implementation_identity()
-    census_config = {
-        "schema": "policy-learnware.real-asset-census-config.v1",
-        "horizon": args.horizon,
-        "expected_dataset_sha256": args.expected_dataset_digest,
-        "expected_oracle_sha256": args.expected_oracle_digest,
-        "expected_density_manifest_sha256": args.expected_density_manifest_digest,
-        "expected_actor_authority_sha256": args.expected_actor_authority_digest,
-        "oracle_supplied": args.oracle is not None,
-        "density_manifest_supplied": args.density_manifest is not None,
-        "actor_authority_supplied": args.actor_authority is not None,
-        "asset_mode": "READ_ONLY",
-    }
-    report.update(
-        {
-            "seed": None,
-            "implementation_commit": implementation["commit"],
-            "implementation": implementation,
-            "config": census_config,
-            "config_sha256": _payload_digest(census_config),
-            "provenance": {
-                "input_paths_recorded": False,
-                "asset_mode": "READ_ONLY",
-                "plan_sha256": V04B_PLAN_SHA256,
-                "capabilities_require_executable_checkers": True,
-            },
-        }
-    )
-    if args.output:
-        _write_canonical_json(_guard_output_location(args.output), report)
-    print(json.dumps(report, sort_keys=True))
-    return 0 if report["status"] == "PASS" else 2
+    raise AssertionError(f"unhandled command: {args.command}")
 
 
 if __name__ == "__main__":

@@ -359,44 +359,6 @@ def test_real_preflight_is_stable_and_all_production_gates_are_no_go(
     assert report["raw_adapter"]["status"] == "NO_GO"
 
 
-def test_census_cli_missing_dataset_emits_stable_reproduction_metadata(
-    tmp_path: Path,
-    capsys,
-):
-    output = tmp_path / "census.json"
-    missing = tmp_path / "missing.npz"
-    assert main(
-        [
-            "census",
-            "--dataset",
-            str(missing),
-            "--horizon",
-            "1000",
-            "--output",
-            str(output),
-        ]
-    ) == 2
-    capsys.readouterr()
-    report = json.loads(output.read_text(encoding="utf-8"))
-    assert report["status"] == "NO_GO"
-    assert report["seed"] is None
-    assert report["config"]["asset_mode"] == "READ_ONLY"
-    assert len(report["config_sha256"]) == 64
-    identity_keys = set(report["implementation"])
-    required_identity = {"commit", "tree", "worktree_status"}
-    assert required_identity <= identity_keys
-    if cli_module._verified_source_checkout() is not None:
-        assert identity_keys == required_identity
-    else:
-        assert {"package_name", "package_version"} <= identity_keys
-        assert report["implementation"]["worktree_status"] in {
-            "INSTALLED_IMMUTABLE_CONTENT",
-            "UNVERIFIED_PACKAGE_LAYOUT",
-        }
-    assert report["provenance"]["input_paths_recorded"] is False
-    assert str(tmp_path) not in output.read_text(encoding="utf-8")
-
-
 def test_cli_outputs_are_no_clobber_and_never_enter_another_git_repo(
     tmp_path: Path,
 ):
@@ -409,7 +371,7 @@ def test_cli_outputs_are_no_clobber_and_never_enter_another_git_repo(
     foreign_repo = tmp_path / "frozen-old-repo"
     (foreign_repo / ".git").mkdir(parents=True)
     forbidden = foreign_repo / "artifacts" / "toy"
-    with pytest.raises(PermissionError, match="different Git repository"):
+    with pytest.raises(PermissionError, match="Git repository"):
         run_toy(forbidden, seed=1, implementation_commit="f" * 40)
     assert not forbidden.exists()
 
@@ -419,8 +381,64 @@ def test_cli_outputs_are_no_clobber_and_never_enter_another_git_repo(
         ["git", f"--git-dir={bare_repo}", "config", "core.bare", "yes"],
         check=True,
     )
-    with pytest.raises(PermissionError, match="different Git repository"):
+    with pytest.raises(PermissionError, match="Git repository"):
         cli_module._guard_output_location(bare_repo / "artifacts" / "toy")
+
+
+def test_artifact_root_precedence_default_and_escape_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    explicit = tmp_path / "explicit"
+    environment = tmp_path / "environment"
+    checkout = tmp_path / "source" / "policy_learnware_ope"
+    monkeypatch.setenv(cli_module.ARTIFACTS_ROOT_ENV, str(environment))
+    monkeypatch.setattr(cli_module, "_verified_source_checkout", lambda: checkout)
+
+    assert cli_module._artifact_path(
+        "ope/toy", artifacts_root=explicit
+    ) == explicit / "ope" / "toy"
+    assert cli_module._artifact_path("ope/toy") == environment / "ope" / "toy"
+    absolute = tmp_path / "legacy" / "receipt.json"
+    assert cli_module._artifact_path(
+        absolute, artifacts_root=explicit
+    ) == absolute.resolve()
+    with pytest.raises(GateClosed, match="escapes"):
+        cli_module._artifact_path("../escape", artifacts_root=explicit)
+
+    explicit.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (explicit / "linked").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(GateClosed, match="escapes"):
+        cli_module._artifact_path("linked/escape", artifacts_root=explicit)
+
+    monkeypatch.delenv(cli_module.ARTIFACTS_ROOT_ENV)
+    assert cli_module._artifact_path("ope/toy") == (
+        checkout.parent / "artifacts" / "ope" / "toy"
+    ).resolve()
+
+
+def test_relative_cli_output_requires_root_in_installed_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(cli_module.ARTIFACTS_ROOT_ENV, raising=False)
+    monkeypatch.setattr(cli_module, "_verified_source_checkout", lambda: None)
+    with pytest.raises(GateClosed, match="installed or foreign layouts require"):
+        cli_module._artifact_path("ope/toy")
+
+    root = tmp_path / "artifacts"
+    assert main(
+        [
+            "real-preflight",
+            "--output",
+            "ope/preflight.json",
+            "--artifacts-root",
+            str(root),
+        ]
+    ) == 2
+    assert (root / "ope" / "preflight.json").is_file()
 
 
 def test_installed_layout_never_inherits_or_writes_foreign_git_identity(
@@ -431,7 +449,8 @@ def test_installed_layout_never_inherits_or_writes_foreign_git_identity(
     if source_root is not None:
         assert source_root == Path(cli_module.__file__).resolve().parents[2]
         source_output = source_root / "artifacts" / "r0-source-layout-check"
-        assert cli_module._guard_output_location(source_output) == source_output
+        with pytest.raises(PermissionError, match="Git repository"):
+            cli_module._guard_output_location(source_output)
 
     foreign = tmp_path / "foreign-consumer"
     foreign.mkdir()
@@ -478,7 +497,7 @@ def test_installed_layout_never_inherits_or_writes_foreign_git_identity(
     assert identity["worktree_status"] == "INSTALLED_IMMUTABLE_CONTENT"
     assert identity["tree"] != foreign_head
     assert foreign_head not in identity["commit"]
-    with pytest.raises(PermissionError, match="different Git repository"):
+    with pytest.raises(PermissionError, match="Git repository"):
         cli_module._guard_output_location(foreign / "artifacts" / "installed-toy")
     outside = tmp_path / "outside-consumer" / "installed-toy"
     assert cli_module._guard_output_location(outside) == outside.resolve()
@@ -924,6 +943,45 @@ def test_real_smoke_seals_three_methods_with_crn_and_resumes_without_reexecution
             tmp_path / "source-run",
             expected_config_sha256=sha256_file(invalid_source_path),
         )
+
+    relative = config_value(list(enumerate(candidate_ids)))
+    for key in ("p0_census_path", "bank_path"):
+        relative["dataset"][key] = Path(relative["dataset"][key]).relative_to(
+            tmp_path
+        ).as_posix()
+    for key in (
+        "fpo_checkout",
+        "policy_repo_checkout",
+        "deployment_private_registry_path",
+    ):
+        relative["actors"][key] = Path(relative["actors"][key]).relative_to(
+            tmp_path
+        ).as_posix()
+    for record in relative["actors"]["candidates"].values():
+        for key in ("authority_path", "bundle_dir"):
+            record[key] = Path(record[key]).relative_to(tmp_path).as_posix()
+    for key in (
+        "authority_path",
+        "repo_root",
+        "raw_view_root",
+        "asset_census_path",
+        "raw_adapter_path",
+    ):
+        relative["raw"][key] = Path(relative["raw"][key]).relative_to(
+            tmp_path
+        ).as_posix()
+    relative_path = tmp_path / "relative-config.json"
+    relative_path.write_bytes(cli_module._canonical_bytes(relative))
+    relative_bytes = relative_path.read_bytes()
+    relative_result = run_real_smoke(
+        "relative-config.json",
+        "relative-run",
+        expected_config_sha256=sha256_file(relative_path),
+        artifacts_root=tmp_path,
+    )
+    assert relative_result["rankings"] == first["rankings"]
+    assert relative_path.read_bytes() == relative_bytes
+    assert (tmp_path / "relative-run" / "run.json").is_file()
 
     estimates_path = tmp_path / "run-b" / "fqe" / "estimates.json"
     estimates_path.write_bytes(estimates_path.read_bytes() + b"tamper")

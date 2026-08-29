@@ -1,92 +1,120 @@
-# Policy Learnware OPE v0.41b
+# Policy Learnware OPE v0.4b development
 
-Small companion repository for method-level, finite-horizon policy-selection
-experiments. The v03 repository, policy bundles, logs, manifests, and oracle
-assets remain read-only external inputs.
+This branch is the minimal companion implementation used for the completed
+v0.4b supporting OPE study. Its scientific terminal state is
+`FROZEN_SUPPORTING_STUDY_PRE_ORACLE_NO_GO`. Source, wheel, synthetic, and
+fixture tests passing does not change that result.
 
-The executable synthetic MVP contains five fitted estimators:
+The audited implementation tip before this maintenance pass is
+`2743f2420840614e8ad4f07e69d8eaa744cdffc5` with tree
+`c238a9feb69fde675f077fbf2d78b351e7f091bc`. It provides finite-horizon FQE,
+the B20-inspired KMIFQE adaptation, compact model-based FF/AR and ETM
+adaptations, digest-locked Raw execution, actor authority checks, ranking
+seals, and an oracle-blind real-smoke runner. These are project adaptations,
+not official-paper numerical reproductions.
 
-- `FH_FQE`: compact NumPy finite-horizon ridge FQE reference.
-- `FH_KMIFQE`: B20 protocol adaptation with a candidate-specific nonlinear
-  critic/target critic, local action-Hessian metrics, B20 bias/variance
-  bandwidth updates, replacement importance resampling, and in-sample TD on
-  logged adjacent actions.
-- `ETM_MBOPE`: B22 protocol adaptation with model-generated training-time
-  Langevin negatives and an analytic gradient-penalty VJP into the trainable
-  RFF energy head.
-- `DOPE_STYLE_MB_FF`: project-defined feed-forward model-based reference. DOPE
-  is inspiration for the benchmark design, not the name of an upstream
-  algorithm implemented here.
-- `AR_MBOPE`: B06-inspired project adaptation/proxy, kept independent from the
-  feed-forward model.
+## Frozen scientific result
 
-Method IDs are derived from the protocol actually executed. Thus the toy run
-emits `..._G099_H5`; only a real `gamma=.99, H=1000` run may emit
-`..._G099_H1000`.
+The two preregistered development cells stopped before any oracle join:
 
-`RAW_ADAPTER_FIXTURE` tests a reward-free, digest-bound TASK_5 request and
-sealed response. It uses fixture scores and is not a Raw-Delta/RKME
-implementation. Production Raw remains `NO_GO_RAW_OPERATOR_AUTHORITY` until a
-trusted export authority and reward-free membership verifier are implemented;
-this release does not expose a production Raw execution path. Live subprocess
-execution is intentionally disabled because this companion cannot yet enforce
-the old repository and assets as read-only.
+- CheetahRun: FQE had genuine projected-Bellman fit divergence
+  (`NO_GO_FIT_DIVERGENCE`). The four-candidate partial ranking is diagnostic
+  only and is invalid for selection or metrics.
+- WalkerWalk: MB-FF produced finite but physically divergent model rollouts
+  (`NO_GO_MODEL_ROLLOUT_DIVERGENCE`). Its seal is retained only as failure
+  evidence.
+- KMIFQE was excluded as
+  `NO_GO_EXISTING_LOG_DENSITY_AND_TARGET_POLICY_SEMANTICS`: the existing
+  clipped-Gaussian log has no exact arbitrary-action density and the
+  keyed-stochastic FPO target does not satisfy the original
+  deterministic-target semantics.
+- ETM was excluded by `NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT`.
+- Raw emits a reward-free selection score (higher is better, negative MMD);
+  that score is not a `J_gamma` value and must not be used for value-error
+  metrics.
+
+The real smoke remained oracle blind. Frozen receipts record
+`oracle_accessed=false` and `environment_accessed=false`; no method subset
+may be selected after the failures. The original plan called FPO deterministic,
+but the frozen actors are per-step `STOCHASTIC_KEYED`; FQE and MB therefore
+use candidate-independent common-random key panels, while KMIFQE fails closed.
+
+The canonical final account is external at the logical path
+`reports/ope/v04b-development/Policy_Learnware_v0.4b_OPE_Supporting_Study_Final.md`.
+The v0.41b method/release account is external at the logical path
+`reports/ope/v041b/Policy_Learnware_v0.41b_Improvement_Report.md`.
+
+## External artifacts
+
+No experiment dataset, actor bundle, run, oracle, wheel, or release receipt is
+tracked here. The single asset root is selected in this order:
+
+1. an absolute CLI/config path;
+2. `--artifacts-root`;
+3. `RL_LEARNWARE_ARTIFACTS_ROOT`;
+4. for a verified source checkout only, `<repository-parent>/artifacts`.
+
+Relative paths are confined below that root. Installed or foreign layouts
+without an explicit root fail closed. The maintained OPE layout is:
+
+```text
+artifacts/
+  ope/
+    runs/v04b-real-smoke-2743f24-r0/
+    releases/v04b-development-2743f24/
+    releases/v041b-9be1d4c/
+    receipts/v04b-development-2743f24/server-permission-freeze-v1/
+  relocation_manifest.json
+```
+
+The real-run tree keeps all three immutable predecessor generations. Release
+evidence keeps the complete nine-file inventory. Shared v03 datasets are
+referenced through the v03 relocation manifest; oracle payloads are not copied
+into OPE artifacts.
+
+Historical absolute-path configs and receipts remain byte-identical and
+continue to resolve as explicit paths. A relocated, relative config is a new
+reconstructed invocation: it binds original asset digests and its new
+implementation identity, while a separate external relocation manifest records
+old-to-new paths and digests. A reconstructed checkout/runtime must report its
+own verified commit/tree and dependencies; it must never claim to be the
+original execution path or overwrite original provenance.
+
+## Run and test
 
 ```bash
 python -m pip install -e '.[test]'
-policy-learnware-ope toy --output artifacts/toy --seed 7
-policy-learnware-ope real-preflight --output artifacts/real-preflight.json
-pytest
+export RL_LEARNWARE_ARTIFACTS_ROOT=/path/to/artifacts
+
+policy-learnware-ope toy \
+  --output ope/toy/seed-7 --seed 7
+policy-learnware-ope real-preflight \
+  --output ope/preflight/development.json
+policy-learnware-ope real-smoke \
+  --config ope/configs/reconstructed/<new-cell>.json \
+  --expected-config-sha256 <sha256> \
+  --output ope/runs/<new-no-clobber-run>
+
+PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider
+git diff --check
 ```
 
-R0 validates both the source checkout and an untracked `0.4.1b0` wheel built
-offline with the declared `setuptools>=77` backend. Installed code never treats
-a consumer repository as this companion checkout: its implementation identity
-is the installed distribution version plus a digest of sorted package Python
-files, and outputs inside a detected foreign worktree or bare Git repository
-are rejected. A malformed `core.bare` value or unreadable bare-repository config
-produces Git `config --bool` return code 128 and also fails closed; the valid
-`core.bare=yes` form is recognized normally, and output outside Git repositories
-remains allowed.
-Source-checkout identity is read from Git only after the canonical `src/`
-layout, project name, and current `cli.py` path are verified. The R0 runtime
-freeze is commit `277c815eb44b8b10abff2c687d8b585031b3d2b3`, tree
-`b00c3a40bc65e58aed2795ca0ce150cd5033cc22`. A no-`.git` archive is used for
-isolated import/tests and as wheel build input; immutable distribution-version
-and package-content identity claims come from a fresh wheel install, not from
-ambient editable metadata.
+`toy` exercises five compact estimators plus the Raw fixture and may return
+`TOY_MVP_PASS`. `real-preflight` is the retained legacy/static pre-asset
+fail-closed check; it does not represent or replace the external final study
+receipt. `real-smoke` is a no-clobber, resumable, pre-oracle bridge for Raw +
+FQE + MB-FF only. Reusing it requires pinned census, membership, actor, bundle,
+Raw authority, config, and implementation identities. Unknown programming
+errors are not converted into scientific gate results.
 
-The real preflight intentionally exits nonzero and records `NO_GO` for the
-three presently missing capabilities: verified actor authority, exact
-arbitrary-action behavior density, and a per-step oracle bound to
-`J(gamma=.99,H=1000)`. Production Raw is separately `NO_GO`. It also exposes
-the method-level `NO_GO_OPS_DS_DENSE_HESSIAN_PANEL` and
-`NO_GO_ETM_INFERENCE_PROTOCOL_ALIGNMENT` blockers without changing synthetic
-toy estimates from `PASS`. No recollection, policy retraining, oracle rewriting,
-or old-asset mutation is performed.
+The canonical frozen cell configs retain their original absolute-path
+provenance and bytes. They are not rewritten after relocation. Any new
+re-execution must use a new config under `ope/configs/reconstructed/`, a
+separate sidecar classified as `RECONSTRUCTED_RELOCATION_CONFIG`, and a new
+no-clobber output path. It cannot resume or claim the identity of the original
+run. `real-preflight` checks only the static fail-closed status path;
+`real-smoke` can exercise the pre-oracle bridge only when the separately pinned
+runtime authorities and verified source checkouts are available. Neither path
+accesses an oracle or changes the frozen scientific conclusion.
 
-Ranking seals are canonical, write-once payloads. Their SHA-256 is retained by
-a separate run manifest and must be supplied when loading or joining an oracle.
-The CLI summary also emits the run, seal, and oracle-manifest digests so a
-caller can retain them outside the artifact directory.
-The toy runner refuses a nonempty output directory, preventing a failed rerun
-from mixing newly overwritten inputs with an older sealed manifest.
-The oracle manifest independently binds context, candidate set, value
-convention, and its caller-held digest. Wall-clock measurements are attached
-only after the seal and are exported in `runtime.json` and post-join metrics.
-
-`TOY_MVP_PASS` means the method executed a real fit/estimate path on the
-synthetic fixture. It does not mean paper-level or official-code parity, and it
-does not claim that the production real-asset gates have passed.
-
-The KMIFQE critic is a compact fixed-tanh-feature NumPy adaptation rather than
-the official fully trained PyTorch network. The ETM energy is a compact RFF
-adaptation rather than the official four-layer MLP. Both export their actual
-configuration and remaining drift, and neither claims published benchmark
-parity.
-
-Hashes are exact for discrete protocol identity, assets, membership, seeds,
-configuration, and sealed ranking artifacts. Floating results are checked with
-declared dtype-aware tolerances plus finiteness, mechanism invariants, and
-ranking stability; a legitimate backend-rounding difference is not treated as
-an asset or protocol mismatch.
+See `THIRD_PARTY.md` for upstream provenance and license boundaries.

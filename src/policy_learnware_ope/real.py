@@ -880,9 +880,26 @@ def _candidate_record(
     if registry_digest != expected_registry_sha256:
         raise _invalid("deployment registry digest mismatch")
     try:
-        input_authority = census["input_authority"][str(supplied_registry)]
-    except (KeyError, TypeError) as exc:
+        input_authorities = census["input_authority"]
+        input_authority = input_authorities.get(str(supplied_registry))
+    except (KeyError, TypeError, AttributeError) as exc:
         raise _invalid("P0 census does not bind the deployment registry") from exc
+    if input_authority is None:
+        digest_matches = [
+            record
+            for original_path, record in input_authorities.items()
+            if isinstance(original_path, str)
+            and Path(original_path).is_absolute()
+            and isinstance(record, Mapping)
+            and record.get("actual_sha256") == expected_registry_sha256
+            and record.get("expected_sha256") == expected_registry_sha256
+            and record.get("status") == "PASS"
+        ]
+        if len(digest_matches) != 1:
+            raise _invalid(
+                "P0 census does not uniquely bind the relocated deployment registry"
+            )
+        input_authority = digest_matches[0]
     if (
         not isinstance(input_authority, Mapping)
         or input_authority.get("actual_sha256") != expected_registry_sha256
