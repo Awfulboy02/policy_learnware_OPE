@@ -58,6 +58,50 @@ TOY_GAMMA = 0.99
 TOY_VALUE_CONVENTION = finite_horizon_value_convention(TOY_GAMMA, TOY_HORIZON)
 V04B_PLAN_SHA256 = "5fb35cc2ee4c27afd411f77f0c2813088b6d6ab901f8910f442ed5b231e1719e"
 ARTIFACTS_ROOT_ENV = "RL_LEARNWARE_ARTIFACTS_ROOT"
+SYSTEM_GIT = "/usr/bin/git"
+RELOCATION_MANIFEST_SHA256 = "81e726c297c78ebc110df017e06e6fb56de73face39371198635299f931bfed9"
+RELOCATION_MANIFEST_SCHEMA = "rl-learnware-relocation/v1"
+
+
+def _git_clean_env() -> dict[str, str]:
+    return {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+
+
+def _reject_symlink_components(path: Path, where: str) -> None:
+    absolute = path.expanduser()
+    if not absolute.is_absolute():
+        raise ValueError(f"{where} must be an absolute path")
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError(f"{where} path component is not auditable: {current}") from exc
+        if current.is_symlink():
+            raise ValueError(f"{where} must not contain a symlink component: {current}")
+
+
+def _validate_relocation_manifest(root: Path) -> None:
+    manifest = root / "relocation_manifest.json"
+    _reject_symlink_components(manifest, "fallback relocation manifest")
+    try:
+        raw = manifest.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("fallback artifacts root lacks the published relocation manifest") from exc
+    if sha256(raw).hexdigest() != RELOCATION_MANIFEST_SHA256:
+        raise ValueError("fallback relocation manifest digest differs from the published manifest")
+    if not isinstance(payload, dict) or set(payload) != {"schema", "mappings"}:
+        raise ValueError("fallback relocation manifest fields differ")
+    if payload["schema"] != RELOCATION_MANIFEST_SCHEMA or not isinstance(payload["mappings"], list):
+        raise ValueError("fallback relocation manifest schema differs")
+    required = {"kind", "source", "target", "content_manifest_sha256", "file_count", "total_bytes", "role", "access_class", "status"}
+    optional = {"completeness", "known_missing"}
+    if any(not isinstance(row, dict) or not required <= set(row) or set(row) - required - optional for row in payload["mappings"]):
+        raise ValueError("fallback relocation manifest mapping fields differ")
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -124,7 +168,7 @@ def _containing_git_root(path: Path) -> Path | None:
             try:
                 bare = subprocess.run(
                     [
-                        "git",
+                        SYSTEM_GIT,
                         f"--git-dir={candidate}",
                         "config",
                         "--bool",
@@ -132,6 +176,7 @@ def _containing_git_root(path: Path) -> Path | None:
                         "core.bare",
                     ],
                     check=False,
+                    env=_git_clean_env(),
                     text=True,
                     capture_output=True,
                 )
@@ -147,7 +192,12 @@ def _containing_git_root(path: Path) -> Path | None:
 def _verified_source_checkout() -> Path | None:
     """Return this package's Git root only for the canonical src layout."""
 
-    current_file = Path(__file__).resolve()
+    lexical_file = Path(__file__).absolute()
+    try:
+        _reject_symlink_components(lexical_file, "package source")
+    except ValueError:
+        return None
+    current_file = lexical_file.resolve()
     candidate = current_file.parents[2]
     expected_cli = candidate / "src" / "policy_learnware_ope" / "cli.py"
     pyproject = candidate / "pyproject.toml"
@@ -157,9 +207,31 @@ def _verified_source_checkout() -> Path | None:
         same_cli = expected_cli.samefile(current_file)
     except (OSError, KeyError, tomllib.TOMLDecodeError):
         return None
-    if not (candidate / ".git").exists() or project_name != "policy-learnware-ope":
+    if project_name != "policy-learnware-ope" or not same_cli:
         return None
-    return candidate if same_cli else None
+    if not (candidate / ".git").is_dir():
+        return None
+    commands = (
+        [SYSTEM_GIT, "rev-parse", "--show-toplevel"],
+        [SYSTEM_GIT, "rev-parse", "--verify", "HEAD^{commit}"],
+        [SYSTEM_GIT, "ls-files", "--error-unmatch", "pyproject.toml"],
+        [SYSTEM_GIT, "diff", "--quiet", "HEAD", "--", "pyproject.toml"],
+        [SYSTEM_GIT, "diff", "--cached", "--quiet", "HEAD", "--", "pyproject.toml"],
+        [SYSTEM_GIT, "status", "--porcelain", "--", "pyproject.toml", "src/policy_learnware_ope"],
+    )
+    try:
+        results = [subprocess.run(command, cwd=candidate, env=_git_clean_env(), check=False, text=True, capture_output=True) for command in commands]
+    except OSError:
+        return None
+    if any(result.returncode != 0 for result in results):
+        return None
+    if results[-1].stdout:
+        return None
+    try:
+        top = Path(results[0].stdout.strip()).resolve(strict=True)
+    except (OSError, ValueError):
+        return None
+    return candidate if top == candidate.resolve() else None
 
 
 def _resolve_artifact_path(
@@ -171,10 +243,14 @@ def _resolve_artifact_path(
 
     requested = Path(path).expanduser()
     if requested.is_absolute():
+        _reject_symlink_components(requested, "artifact path")
         return requested.resolve()
     configured_root = artifacts_root
     if configured_root is None:
-        configured_root = os.environ.get(ARTIFACTS_ROOT_ENV) or None
+        if ARTIFACTS_ROOT_ENV in os.environ:
+            configured_root = os.environ[ARTIFACTS_ROOT_ENV]
+            if not str(configured_root).strip():
+                raise ValueError(f"{ARTIFACTS_ROOT_ENV} must not be empty")
     if configured_root is None:
         checkout = _verified_source_checkout()
         if checkout is None:
@@ -183,12 +259,17 @@ def _resolve_artifact_path(
                 "outside a verified source checkout"
             )
         root = checkout.parent / "artifacts"
+        _reject_symlink_components(root, "fallback artifacts root")
+        _validate_relocation_manifest(root)
     else:
         root = Path(configured_root).expanduser()
         if not root.is_absolute():
             raise ValueError("artifacts root must be an absolute path")
+    _reject_symlink_components(root, "artifacts root")
     resolved_root = root.resolve()
-    resolved = (resolved_root / requested).resolve()
+    lexical = resolved_root / requested
+    _reject_symlink_components(lexical, "artifact path")
+    resolved = lexical.resolve()
     try:
         resolved.relative_to(resolved_root)
     except ValueError as exc:
@@ -232,7 +313,11 @@ def _installed_package_identity() -> dict[str, Any]:
 def _guard_output_location(path: str | Path) -> Path:
     """Reject artifact writes into any Git worktree or bare repository."""
 
-    destination = Path(path).resolve()
+    requested = Path(path).expanduser()
+    if not requested.is_absolute():
+        raise ValueError("guarded output path must already be absolute")
+    _reject_symlink_components(requested, "output path")
+    destination = requested.resolve()
     containing_repo = _containing_git_root(destination)
     if containing_repo is not None:
         raise PermissionError(
@@ -253,25 +338,28 @@ def _implementation_identity(commit_override: str | None = None) -> dict[str, An
         return _installed_package_identity()
     try:
         commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            [SYSTEM_GIT, "rev-parse", "HEAD"],
             cwd=repository,
             check=True,
             text=True,
             capture_output=True,
+            env=_git_clean_env(),
         ).stdout.strip()
         tree = subprocess.run(
-            ["git", "rev-parse", "HEAD^{tree}"],
+            [SYSTEM_GIT, "rev-parse", "HEAD^{tree}"],
             cwd=repository,
             check=True,
             text=True,
             capture_output=True,
+            env=_git_clean_env(),
         ).stdout.strip()
         worktree = subprocess.run(
-            ["git", "status", "--porcelain"],
+            [SYSTEM_GIT, "status", "--porcelain"],
             cwd=repository,
             check=True,
             text=True,
             capture_output=True,
+            env=_git_clean_env(),
         ).stdout
         return {
             "commit": commit,

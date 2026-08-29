@@ -350,9 +350,8 @@ def test_installed_layout_never_inherits_or_writes_foreign_git_identity(
             match="refusing to write into a Git repository",
         ):
             cli_module._guard_output_location(source_output)
-        assert cli_module._resolve_artifact_path("ope/toy") == (
-            source_root.parent / "artifacts" / "ope" / "toy"
-        ).resolve()
+        with pytest.raises(ValueError, match="published relocation manifest"):
+            cli_module._resolve_artifact_path("ope/toy")
     else:
         with pytest.raises(ValueError, match="relative artifact path requires"):
             cli_module._resolve_artifact_path("ope/toy")
@@ -400,7 +399,7 @@ def test_installed_layout_never_inherits_or_writes_foreign_git_identity(
     with pytest.raises(ValueError, match="relative artifact path requires"):
         cli_module._resolve_artifact_path("ope/toy")
     monkeypatch.setenv(cli_module.ARTIFACTS_ROOT_ENV, "")
-    with pytest.raises(ValueError, match="relative artifact path requires"):
+    with pytest.raises(ValueError, match="must not be empty"):
         cli_module._resolve_artifact_path("ope/toy")
     monkeypatch.setenv(cli_module.ARTIFACTS_ROOT_ENV, "relative-root")
     with pytest.raises(ValueError, match="artifacts root must be an absolute path"):
@@ -429,31 +428,43 @@ def test_installed_layout_never_inherits_or_writes_foreign_git_identity(
     outside_target = tmp_path / "outside-link-target"
     outside_target.mkdir()
     (explicit_root / "escape-link").symlink_to(outside_target, target_is_directory=True)
-    with pytest.raises(ValueError, match="escapes the selected artifacts root"):
+    with pytest.raises(ValueError, match="symlink component"):
         cli_module._resolve_artifact_path(
             "escape-link/artifact",
             artifacts_root=explicit_root,
         )
     absolute_artifact = tmp_path / "absolute-artifact"
-    assert cli_module._resolve_artifact_path(
-        absolute_artifact,
-        artifacts_root="relative-root",
-    ) == absolute_artifact.resolve()
-
+    assert cli_module._resolve_artifact_path(absolute_artifact, artifacts_root="relative-root") == absolute_artifact.resolve()
     identity = cli_module._implementation_identity()
     assert identity["package_version"] == "0.4.1b0"
     assert identity["worktree_status"] == "INSTALLED_IMMUTABLE_CONTENT"
     assert identity["tree"] != foreign_head
     assert foreign_head not in identity["commit"]
-    with pytest.raises(
-        PermissionError,
-        match="refusing to write into a Git repository",
-    ):
+    with pytest.raises(PermissionError, match="refusing to write into a Git repository"):
         cli_module._guard_output_location(foreign / "artifacts" / "installed-toy")
     outside = tmp_path / "outside-consumer" / "installed-toy"
     assert cli_module._guard_output_location(outside) == outside.resolve()
-    assert cli_module._implementation_identity("e" * 40) == {
-        "commit": "e" * 40,
-        "tree": "CALLER_SUPPLIED",
-        "worktree_status": "CALLER_SUPPLIED",
-    }
+    assert cli_module._implementation_identity("e" * 40)["commit"] == "e" * 40
+
+
+def test_artifact_resolver_rejects_symlink_roots_empty_env_and_git_env_spoof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink component"):
+        cli_module._resolve_artifact_path("x", artifacts_root=alias)
+    broken = tmp_path / "broken"
+    broken.symlink_to(tmp_path / "missing")
+    with pytest.raises(ValueError, match="symlink component"):
+        cli_module._resolve_artifact_path(broken / "x")
+    monkeypatch.setenv(cli_module.ARTIFACTS_ROOT_ENV, " \t ")
+    with pytest.raises(ValueError, match="must not be empty"):
+        cli_module._resolve_artifact_path("x")
+    monkeypatch.setenv("GIT_DIR", str(Path.cwd() / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
+    monkeypatch.setenv("git_dir", str(tmp_path / "lowercase-spoof"))
+    monkeypatch.setenv("PATH", str(tmp_path / "fake-bin"))
+    assert cli_module._verified_source_checkout() is None
